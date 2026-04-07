@@ -17,8 +17,7 @@ BrowserApp::BrowserApp() {}
 void BrowserApp::OnBeforeCommandLineProcessing(
     const CefString& process_type,
     CefRefPtr<CefCommandLine> command_line) {
-    // OSR uses software rendering
-    command_line->AppendSwitch("disable-gpu");
+    // OSR handles its own compositing, but allow GPU for WebGL etc.
     command_line->AppendSwitch("disable-gpu-compositing");
     command_line->AppendSwitch("in-process-gpu");
     // Single-process: renderer runs in-process (avoids subprocess crashes)
@@ -49,6 +48,7 @@ void BrowserApp::OnContextInitialized() {
     CefRegisterSchemeHandlerFactory("orb", "newtab", factory);
     CefRegisterSchemeHandlerFactory("orb", "history", factory);
     CefRegisterSchemeHandlerFactory("orb", "downloads", factory);
+    CefRegisterSchemeHandlerFactory("orb", "gpu", factory);
 
     // Load ad blocker filter rules
     auto filter_rules = std::make_shared<FilterRuleSet>();
