@@ -1,0 +1,19 @@
+# Build
+build/
+cmake-build-*/
+
+# CEF binary distribution (too large for git)
+third_party/cef/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
