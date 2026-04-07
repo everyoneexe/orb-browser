@@ -119,11 +119,11 @@ resources/
 - [x] Keyboard shortcuts (Ctrl+T/W/L/Tab, F11, F12)
 - [x] Configurable search engine (Google, DuckDuckGo, Bing, Brave)
 - [x] Configurable download directory
+- [x] Wayland support
 
 ### Planned
 
 - [ ] Windows support
-- [ ] Wayland support
 - [ ] Extension support
 - [ ] Sync (bookmarks, history, settings)
 - [ ] Multiple profiles
