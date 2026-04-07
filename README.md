@@ -2,6 +2,8 @@
 
 A lightweight, CEF-based web browser for Linux with off-screen rendering, a vertical sidebar UI, and built-in ad blocking.
 
+![Orb Browser](assets/screenshot.png)
+
 ## Features
 
 - **Off-Screen Rendering (OSR)** -- All rendering composited through Cairo, no native CEF windows
