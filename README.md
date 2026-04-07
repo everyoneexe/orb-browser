@@ -95,6 +95,49 @@ resources/
   easyprivacy.txt          -- Privacy filter list
 ```
 
+## Roadmap
+
+### Done
+
+- [x] CEF off-screen rendering with Cairo compositing
+- [x] Vertical sidebar (tab list, navigation, bookmarks)
+- [x] Collapsible sidebar (Ctrl+S pin/unpin, hover to show)
+- [x] Custom frameless titlebar with minimize/maximize/close
+- [x] Tab management (open, close, switch, drag reorder)
+- [x] Incognito tabs
+- [x] New tab page with search bar and shortcut grid
+- [x] Customizable backgrounds (solid/gradient/image upload)
+- [x] Built-in ad blocker (EasyList + EasyPrivacy)
+- [x] Per-domain zoom persistence
+- [x] Session restore
+- [x] Find in page (Ctrl+F)
+- [x] Bookmarks (Ctrl+D)
+- [x] History page (orb://history/)
+- [x] Downloads page (orb://downloads/)
+- [x] URL autocomplete from history/bookmarks
+- [x] Context menu (open in new tab, copy link, inspect)
+- [x] Keyboard shortcuts (Ctrl+T/W/L/Tab, F11, F12)
+- [x] Configurable search engine (Google, DuckDuckGo, Bing, Brave)
+- [x] Configurable download directory
+
+### Planned
+
+- [ ] Windows support
+- [ ] Wayland support
+- [ ] Extension support
+- [ ] Sync (bookmarks, history, settings)
+- [ ] Multiple profiles
+- [ ] Reader mode
+- [ ] Picture-in-picture
+- [ ] Tab groups
+- [ ] Custom themes/CSS
+- [ ] Autofill (forms, passwords)
+- [ ] Translation
+- [ ] PDF viewer
+- [ ] Print to PDF
+- [ ] Notification support
+- [ ] Hardware video acceleration
+
 ## License
 
 MIT
