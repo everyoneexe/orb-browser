@@ -89,8 +89,8 @@ endif()
 # Copy UI assets to build directory (at configure time)
 file(COPY "${CMAKE_SOURCE_DIR}/src/ui/" DESTINATION "${CMAKE_BINARY_DIR}/ui")
 
-# Also copy on every build so edits to JS/CSS/HTML are picked up
-add_custom_command(TARGET zen-browser POST_BUILD
+# Always sync UI assets on every build (even if no C++ changed)
+add_custom_target(sync_ui ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/src/ui" "${CMAKE_BINARY_DIR}/ui"
     COMMENT "Syncing UI assets"

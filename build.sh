@@ -3,22 +3,37 @@ set -e
 
 cd "$(dirname "$0")"
 
-echo "=== Zen Browser Build Script ==="
+echo "=== Orb Browser Build Script ==="
 
 # Check CEF
 if [ ! -d "third_party/cef" ]; then
     echo ""
-    echo "CEF binary distribution not found!"
+    echo "CEF binary distribution not found. Downloading..."
     echo ""
-    echo "Download it from: https://cef-builds.spotifycdn.com/index.html"
-    echo "  - Select 'Linux 64-bit' -> 'Standard Distribution'"
-    echo "  - Extract and rename to third_party/cef/"
-    echo ""
-    echo "Example:"
-    echo "  wget 'https://cef-builds.spotifycdn.com/cef_binary_<VERSION>_linux64.tar.bz2'"
-    echo "  tar xf cef_binary_*_linux64.tar.bz2"
-    echo "  mv cef_binary_*_linux64 third_party/cef"
-    exit 1
+
+    CEF_VERSION="146.0.10+g8219561+chromium-146.0.7680.179"
+    CEF_URL="https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION}_linux64.tar.bz2"
+
+    mkdir -p third_party
+    cd third_party
+
+    echo "Downloading CEF ($CEF_VERSION)..."
+    if command -v wget &>/dev/null; then
+        wget -q --show-progress "$CEF_URL" -O cef.tar.bz2
+    elif command -v curl &>/dev/null; then
+        curl -L --progress-bar "$CEF_URL" -o cef.tar.bz2
+    else
+        echo "Error: wget or curl required"
+        exit 1
+    fi
+
+    echo "Extracting..."
+    tar xf cef.tar.bz2
+    mv cef_binary_*_linux64 cef
+    rm cef.tar.bz2
+
+    echo "CEF downloaded successfully."
+    cd ..
 fi
 
 # Download filter lists if not present
@@ -39,4 +54,4 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
 echo ""
-echo "Build complete! Run with: cd build && ./zen-browser"
+echo "Build complete! Run with: cd build && ./orb-browser"
