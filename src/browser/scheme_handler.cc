@@ -447,8 +447,8 @@ body{
 document.querySelector('.search-input').addEventListener('keydown',function(e){
   if(e.key==='Enter'&&this.value.trim()){
     var q=this.value.trim();
-    if(/^https?:\/\//i.test(q)||/^[a-zA-Z0-9][\w-]*\.[a-zA-Z]{2,}/.test(q)){
-      location.href=q.match(/^https?:\/\//i)?q:'https://'+q;
+    if(/^https?:\/\//i.test(q)||/^orb:\/\//i.test(q)||/^[a-zA-Z0-9][\w-]*\.[a-zA-Z]{2,}/.test(q)){
+      location.href=q.match(/^https?:\/\/|^orb:\/\//i)?q:'https://'+q;
     }else{
       location.href=')HTML" + search_url + R"HTML('+encodeURIComponent(q);
     }
@@ -1026,7 +1026,148 @@ render();
         return handler;
     }
 
-    // ─── orb://chrome/ ──────────────────────────────────────
+    // ─── orb://gpu/ ────────────────────────────────────────
+    if (url.find("orb://gpu") == 0) {
+        std::string html = R"HTML(<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>GPU Information</title><style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  background:#1a1b26;color:#c0caf5;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',monospace;
+  padding:32px;overflow-y:auto;
+}
+h1{font-size:20px;font-weight:600;margin-bottom:24px;color:#7aa2f7}
+h2{font-size:14px;font-weight:600;margin:20px 0 10px;color:#9aa5ce;text-transform:uppercase;letter-spacing:.5px}
+.card{
+  background:#1e2030;border:1px solid #232433;border-radius:8px;
+  padding:16px;margin-bottom:16px;
+}
+table{width:100%;border-collapse:collapse}
+td{padding:6px 12px;font-size:13px;border-bottom:1px solid #232433}
+td:first-child{color:#565f89;width:220px;white-space:nowrap}
+td:last-child{color:#c0caf5;word-break:break-all}
+.status-on{color:#9ece6a}
+.status-off{color:#f7768e}
+.status-warn{color:#e0af68}
+#loading{color:#565f89;font-size:13px}
+</style></head><body>
+<h1>GPU Information</h1>
+<div id="loading">Collecting GPU information...</div>
+<div id="content" style="display:none">
+
+<h2>WebGL</h2>
+<div class="card"><table id="webgl-table"></table></div>
+
+<h2>Canvas / Rendering</h2>
+<div class="card"><table id="canvas-table"></table></div>
+
+<h2>Hardware</h2>
+<div class="card"><table id="hw-table"></table></div>
+
+<h2>Features</h2>
+<div class="card"><table id="features-table"></table></div>
+
+</div>
+
+<script>
+function addRow(tableId, key, value, status) {
+  var t = document.getElementById(tableId);
+  var tr = document.createElement('tr');
+  var td1 = document.createElement('td');
+  td1.textContent = key;
+  var td2 = document.createElement('td');
+  if (status === 'on') td2.className = 'status-on';
+  else if (status === 'off') td2.className = 'status-off';
+  else if (status === 'warn') td2.className = 'status-warn';
+  td2.textContent = value;
+  tr.appendChild(td1);
+  tr.appendChild(td2);
+  t.appendChild(tr);
+}
+
+function collect() {
+  // WebGL info
+  var c = document.createElement('canvas');
+  var gl = c.getContext('webgl2') || c.getContext('webgl');
+  if (gl) {
+    var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    addRow('webgl-table', 'WebGL Version', gl.getParameter(gl.VERSION));
+    addRow('webgl-table', 'GLSL Version', gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+    if (dbg) {
+      addRow('webgl-table', 'GPU Vendor', gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL));
+      addRow('webgl-table', 'GPU Renderer', gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+    }
+    addRow('webgl-table', 'Vendor (masked)', gl.getParameter(gl.VENDOR));
+    addRow('webgl-table', 'Renderer (masked)', gl.getParameter(gl.RENDERER));
+    addRow('webgl-table', 'Max Texture Size', gl.getParameter(gl.MAX_TEXTURE_SIZE) + 'px');
+    addRow('webgl-table', 'Max Viewport', JSON.stringify(gl.getParameter(gl.MAX_VIEWPORT_DIMS)));
+    addRow('webgl-table', 'Max Renderbuffer', gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) + 'px');
+    addRow('webgl-table', 'Antialiasing', gl.getContextAttributes().antialias ? 'Enabled' : 'Disabled',
+      gl.getContextAttributes().antialias ? 'on' : 'off');
+    var exts = gl.getSupportedExtensions();
+    addRow('webgl-table', 'Extensions', exts ? exts.length + ' supported' : 'None');
+  } else {
+    addRow('webgl-table', 'WebGL', 'Not available', 'off');
+  }
+
+  // WebGL2 check
+  var gl2 = c.getContext('webgl2');
+  addRow('webgl-table', 'WebGL 2.0', gl2 ? 'Available' : 'Not available', gl2 ? 'on' : 'off');
+
+  // Canvas
+  var c2 = document.createElement('canvas');
+  var ctx = c2.getContext('2d');
+  addRow('canvas-table', '2D Canvas', ctx ? 'Available' : 'Not available', ctx ? 'on' : 'off');
+
+  // OffscreenCanvas
+  addRow('canvas-table', 'OffscreenCanvas', typeof OffscreenCanvas !== 'undefined' ? 'Available' : 'Not available',
+    typeof OffscreenCanvas !== 'undefined' ? 'on' : 'off');
+
+  // WebGPU
+  addRow('canvas-table', 'WebGPU', navigator.gpu ? 'Available' : 'Not available',
+    navigator.gpu ? 'on' : 'off');
+
+  // Hardware info
+  addRow('hw-table', 'Platform', navigator.platform);
+  addRow('hw-table', 'User Agent', navigator.userAgent);
+  addRow('hw-table', 'Logical Cores', navigator.hardwareConcurrency || 'Unknown');
+  addRow('hw-table', 'Device Memory', navigator.deviceMemory ? navigator.deviceMemory + ' GB' : 'Unknown');
+  addRow('hw-table', 'Device Pixel Ratio', window.devicePixelRatio);
+  addRow('hw-table', 'Screen', screen.width + 'x' + screen.height);
+  addRow('hw-table', 'Color Depth', screen.colorDepth + ' bit');
+
+  // Feature detection
+  var features = [
+    ['Hardware Concurrency', !!navigator.hardwareConcurrency],
+    ['SharedArrayBuffer', typeof SharedArrayBuffer !== 'undefined'],
+    ['WebAssembly', typeof WebAssembly !== 'undefined'],
+    ['WebRTC', !!window.RTCPeerConnection],
+    ['WebSocket', !!window.WebSocket],
+    ['Service Worker', 'serviceWorker' in navigator],
+    ['Web Workers', !!window.Worker],
+    ['Intersection Observer', !!window.IntersectionObserver],
+    ['ResizeObserver', !!window.ResizeObserver],
+    ['Web Animations API', !!Element.prototype.animate],
+    ['CSS Houdini (Paint)', !!CSS.paintWorklet],
+    ['Gamepad API', !!navigator.getGamepads],
+  ];
+  features.forEach(function(f) {
+    addRow('features-table', f[0], f[1] ? 'Supported' : 'Not supported', f[1] ? 'on' : 'off');
+  });
+
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('content').style.display = '';
+}
+
+collect();
+</script>
+</body></html>)HTML";
+
+        auto* handler = new OrbResourceHandler("");
+        handler->SetInlineData(html, "text/html");
+        return handler;
+    }
     // Parse path from orb://chrome/path
     // URL format: orb://chrome/file.html
     std::string prefix = "orb://chrome/";
