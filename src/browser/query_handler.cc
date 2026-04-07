@@ -139,6 +139,12 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
+std::string GetPinnedPath() {
+    const char* home = getenv("HOME");
+    if (!home) home = "/tmp";
+    return std::string(home) + "/.config/orb-browser/pinned.json";
+}
+
 }  // namespace
 
 OrbQueryHandler::OrbQueryHandler(TabManager* tab_manager, BrowserWindow* window)
@@ -156,8 +162,9 @@ bool OrbQueryHandler::OnQuery(CefRefPtr<CefBrowser> browser,
     if (cmd == "newTab") {
         std::string url = GetJsonString(json, "url");
         if (url.empty()) url = "about:blank";
+        bool pinned = GetJsonBool(json, "pinned");
 
-        int tab_id = tab_manager_->CreateTab(url);
+        int tab_id = tab_manager_->CreateTab(url, pinned);
         window_->CreateTabBrowser(tab_id, url);
 
         callback->Success("{\"tabId\":" + std::to_string(tab_id) + "}");
@@ -646,6 +653,65 @@ bool OrbQueryHandler::OnQuery(CefRefPtr<CefBrowser> browser,
         } else {
             callback->Failure(1, "No window");
         }
+        return true;
+    }
+
+    // ─── Pinned Tabs ────────────────────────────────────────
+
+    if (cmd == "getPinnedTabs") {
+        std::string data = ReadFileJson(GetPinnedPath());
+        if (data == "[]") {
+            // Default pinned tabs on first run
+            data = "[{\"url\":\"https://www.google.com\"},{\"url\":\"https://github.com\"},{\"url\":\"https://www.youtube.com\"}]";
+            WriteFileJson(GetPinnedPath(), data);
+        }
+        callback->Success(data);
+        return true;
+    }
+
+    if (cmd == "pinTab") {
+        int tab_id = GetJsonInt(json, "tabId");
+        std::string url = GetJsonString(json, "url");
+        if (tab_id >= 0) {
+            tab_manager_->SetTabPinned(tab_id, true);
+        }
+        if (!url.empty()) {
+            // Add to pinned.json
+            std::string data = ReadFileJson(GetPinnedPath());
+            if (data == "[]") data = "[]";
+            if (data.back() == ']') data.pop_back();
+            if (data.size() > 1) data += ",";
+            data += "{\"url\":\"" + JsonEscape(url) + "\"}]";
+            WriteFileJson(GetPinnedPath(), data);
+        }
+        callback->Success("{}");
+        return true;
+    }
+
+    if (cmd == "unpinTab") {
+        int tab_id = GetJsonInt(json, "tabId");
+        std::string url = GetJsonString(json, "url");
+        if (tab_id >= 0) {
+            tab_manager_->SetTabPinned(tab_id, false);
+        }
+        if (!url.empty()) {
+            // Remove from pinned.json
+            std::string data = ReadFileJson(GetPinnedPath());
+            std::string search = "\"url\":\"" + JsonEscape(url) + "\"";
+            auto pos = data.find(search);
+            if (pos != std::string::npos) {
+                auto start = data.rfind('{', pos);
+                auto end = data.find('}', pos);
+                if (start != std::string::npos && end != std::string::npos) {
+                    end++;
+                    if (end < data.size() && data[end] == ',') end++;
+                    else if (start > 0 && data[start - 1] == ',') start--;
+                    data.erase(start, end - start);
+                }
+            }
+            WriteFileJson(GetPinnedPath(), data);
+        }
+        callback->Success("{}");
         return true;
     }
 
