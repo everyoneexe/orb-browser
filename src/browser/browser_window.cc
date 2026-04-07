@@ -786,6 +786,7 @@ void BrowserWindow::CreateFirstTab() {
             // Parse JSON array of {url, title} objects
             // Find all "url":"..." entries
             bool restored = false;
+            bool first_tab = true;
             size_t pos = 0;
             while ((pos = content.find("\"url\":\"", pos)) != std::string::npos) {
                 pos += 7; // skip "url":"
@@ -800,7 +801,13 @@ void BrowserWindow::CreateFirstTab() {
 
                 if (!url.empty()) {
                     int tab_id = tab_manager_.CreateTab(url);
-                    CreateTabBrowser(tab_id, url);
+                    if (first_tab) {
+                        // Only load the first tab immediately
+                        CreateTabBrowser(tab_id, url);
+                        first_tab = false;
+                    }
+                    // Other tabs are lazy — created in UI but no browser yet
+                    // They'll load when user clicks (switchTab triggers CreateTabBrowser)
                     restored = true;
                 }
                 pos = end + 1;
@@ -1028,7 +1035,7 @@ void BrowserWindow::Close() {
             bool first = true;
             for (int id : ids) {
                 const TabInfo* info = tab_manager_.GetTab(id);
-                if (info && !info->url.empty() && info->url != "about:blank" && info->url.find("orb://") != 0) {
+                if (info && !info->pinned && !info->url.empty() && info->url != "about:blank" && info->url.find("orb://") != 0) {
                     if (!first) f << ",";
                     // Simple JSON escape
                     std::string url = info->url;

@@ -23,17 +23,19 @@ std::string JsEscape(const std::string& s) {
 
 TabManager::TabManager() {}
 
-int TabManager::CreateTab(const std::string& url) {
+int TabManager::CreateTab(const std::string& url, bool pinned) {
     int id = next_id_++;
     TabInfo info;
     info.id = id;
     info.url = url;
     info.title = "New Tab";
+    info.pinned = pinned;
     tabs_[id] = info;
 
     // Notify UI about new tab
     NotifyUI("if(typeof orb !== 'undefined') orb.onTabCreated(" +
-             std::to_string(id) + ",'" + JsEscape(url) + "');");
+             std::to_string(id) + ",'" + JsEscape(url) + "',false," +
+             (pinned ? "true" : "false") + ");");
 
     return id;
 }
@@ -57,21 +59,41 @@ void TabManager::CloseTab(int tab_id) {
     auto it = tabs_.find(tab_id);
     if (it == tabs_.end()) return;
 
+    // Pinned tabs cannot be closed
+    if (it->second.pinned) return;
+
     // If closing active tab, switch to another first
     if (tab_id == active_tab_id_) {
-        auto ids = GetTabIds();
-        if (ids.size() > 1) {
-            for (size_t i = 0; i < ids.size(); i++) {
-                if (ids[i] == tab_id) {
-                    int next = (i + 1 < ids.size()) ? ids[i + 1] : ids[i - 1];
-                    SwitchTab(next);
+        // Find non-pinned tabs to switch to
+        std::vector<int> normal_ids;
+        for (const auto& pair : tabs_) {
+            if (!pair.second.pinned && pair.first != tab_id)
+                normal_ids.push_back(pair.first);
+        }
+
+        if (!normal_ids.empty()) {
+            // Find closest tab
+            auto all_ids = GetTabIds();
+            int next = normal_ids[0];
+            for (size_t i = 0; i < all_ids.size(); i++) {
+                if (all_ids[i] == tab_id) {
+                    // Look forward then backward for non-pinned
+                    for (size_t j = i + 1; j < all_ids.size(); j++) {
+                        auto jt = tabs_.find(all_ids[j]);
+                        if (jt != tabs_.end() && !jt->second.pinned) { next = all_ids[j]; goto found; }
+                    }
+                    for (int j = (int)i - 1; j >= 0; j--) {
+                        auto jt = tabs_.find(all_ids[j]);
+                        if (jt != tabs_.end() && !jt->second.pinned) { next = all_ids[j]; goto found; }
+                    }
                     break;
                 }
             }
+            found:
+            SwitchTab(next);
         } else {
-            // Last tab — open a new newtab before closing
+            // No normal tabs left — open a new newtab
             if (window_) {
-                // Read search engine from settings for newtab URL
                 std::string engine = "google";
                 const char* home = getenv("HOME");
                 if (home) {
@@ -105,8 +127,16 @@ void TabManager::CloseTab(int tab_id) {
 
 void TabManager::CloseActiveTab() {
     if (active_tab_id_ >= 0) {
+        auto it = tabs_.find(active_tab_id_);
+        if (it != tabs_.end() && it->second.pinned) return;  // Skip pinned
         CloseTab(active_tab_id_);
     }
+}
+
+void TabManager::SetTabPinned(int tab_id, bool pinned) {
+    auto it = tabs_.find(tab_id);
+    if (it == tabs_.end()) return;
+    it->second.pinned = pinned;
 }
 
 void TabManager::SwitchTab(int tab_id) {
@@ -114,6 +144,11 @@ void TabManager::SwitchTab(int tab_id) {
     if (it == tabs_.end()) return;
 
     active_tab_id_ = tab_id;
+
+    // Lazy load: if no browser yet, create one now
+    if (!it->second.browser && window_) {
+        window_->CreateTabBrowser(tab_id, it->second.url);
+    }
 
     // Show the tab's surface in BrowserWindow
     if (window_) window_->ShowTab(tab_id);
