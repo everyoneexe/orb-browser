@@ -53,5 +53,16 @@ cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
+# Copy Widevine DRM if available on system
+if [ ! -d "WidevineCdm" ]; then
+    for wv_path in /usr/lib/chromium/WidevineCdm /usr/lib64/chromium/WidevineCdm /opt/google/chrome/WidevineCdm; do
+        if [ -d "$wv_path" ]; then
+            cp -r "$wv_path" WidevineCdm
+            echo "Widevine CDM copied from $wv_path"
+            break
+        fi
+    done
+fi
+
 echo ""
 echo "Build complete! Run with: cd build && ./orb-browser"
