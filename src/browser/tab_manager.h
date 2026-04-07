@@ -19,6 +19,7 @@ struct TabInfo {
     std::string url;
     bool loading = false;
     bool incognito = false;
+    bool pinned = false;
 };
 
 class TabManager {
@@ -30,10 +31,11 @@ public:
     void SetNotifyCallback(NotifyCallback cb) { notify_cb_ = cb; }
     void SetBrowserWindow(BrowserWindow* window) { window_ = window; }
 
-    int CreateTab(const std::string& url);
+    int CreateTab(const std::string& url, bool pinned = false);
     int CreateIncognitoTab(const std::string& url);
     void CloseTab(int tab_id);
     void CloseActiveTab();
+    void SetTabPinned(int tab_id, bool pinned);
     void SwitchTab(int tab_id);
     void SwitchToNextTab();
     void SwitchToPrevTab();
