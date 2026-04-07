@@ -2,6 +2,8 @@
 #include "include/cef_app.h"
 
 #include <gtk/gtk.h>
+#include <cstdlib>
+#include <string>
 
 int main(int argc, char* argv[]) {
     // Force X11 backend — CEF requires X11 on Linux
@@ -18,12 +20,21 @@ int main(int argc, char* argv[]) {
         return exit_code;
     }
 
+    // Persistent cache path for Widevine registration etc.
+    std::string cache_path;
+    const char* home = getenv("HOME");
+    if (home) {
+        cache_path = std::string(home) + "/.cache/orb-browser";
+    } else {
+        cache_path = "/tmp/orb-browser-cache";
+    }
+
     CefSettings settings;
     settings.no_sandbox = true;
     settings.multi_threaded_message_loop = false;
     settings.windowless_rendering_enabled = true;
     CefString(&settings.locale).FromASCII("en-US");
-    CefString(&settings.root_cache_path).FromASCII("/tmp/orb-browser-cache");
+    CefString(&settings.root_cache_path).FromString(cache_path);
 
     if (!CefInitialize(main_args, settings, app, nullptr)) {
         return 1;
