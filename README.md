@@ -71,6 +71,17 @@ make -j$(nproc)
 cd build && ./zen-browser
 ```
 
+## Benchmarks
+
+Tested on Linux x86_64 with NVIDIA GeForce RTX 4070 Laptop GPU. Same machine, same conditions.
+
+| Benchmark | Orb Browser | Ungoogled Chromium | Notes |
+|:----------|:------------|:-------------------|:------|
+| Speedometer 3.0 | 20.4 | 22.0 | JS/DOM performance |
+| MotionMark 1.2 | 720.98 | 707.97 | Graphics/rendering |
+
+Orb Browser uses CEF with off-screen rendering (OSR), single-process mode, and a minimal UI layer. The simplified rendering pipeline and lack of multi-process IPC overhead result in competitive graphics performance despite the OSR compositing cost.
+
 ## Project Structure
 
 ```
