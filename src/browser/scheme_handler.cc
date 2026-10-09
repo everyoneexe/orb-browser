@@ -569,19 +569,42 @@ function renderShortcuts(){
     scGrid.style.display='none';return;
   }
   scGrid.style.display='flex';
-  var html='';
+  // Shortcut names/URLs come from localStorage: build nodes, never innerHTML.
+  var frag=document.createDocumentFragment();
   shortcuts.forEach(function(sc,i){
-    var fav=getFavicon(sc.url);
-    html+='<a class="sc-item" href="'+sc.url.replace(/"/g,'&quot;')+'" data-idx="'+i+'">';
-    html+='<div class="sc-icon"><img src="'+fav+'" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">';
-    html+='<span class="sc-icon-letter" style="display:none">'+getInitial(sc.name,sc.url)+'</span></div>';
-    html+='<span class="sc-label">'+sc.name+'</span></a>';
+    var a=document.createElement('a');
+    a.className='sc-item';
+    a.href=/^https?:\/\//i.test(sc.url)?sc.url:'#';
+    a.dataset.idx=i;
+
+    var icon=document.createElement('div');
+    icon.className='sc-icon';
+    var img=document.createElement('img');
+    img.src=getFavicon(sc.url);
+    var letter=document.createElement('span');
+    letter.className='sc-icon-letter';
+    letter.style.display='none';
+    letter.textContent=getInitial(sc.name,sc.url);
+    img.onerror=function(){this.style.display='none';letter.style.display='flex';};
+    icon.appendChild(img);
+    icon.appendChild(letter);
+
+    var label=document.createElement('span');
+    label.className='sc-label';
+    label.textContent=sc.name;
+
+    a.appendChild(icon);
+    a.appendChild(label);
+    frag.appendChild(a);
   });
   // Add shortcut button
-  html+='<div class="sc-item sc-add" id="scAddBtn">';
-  html+='<div class="sc-icon"><svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>';
-  html+='<span class="sc-label">Add shortcut</span></div>';
-  scGrid.innerHTML=html;
+  var add=document.createElement('div');
+  add.className='sc-item sc-add';
+  add.id='scAddBtn';
+  add.innerHTML='<div class="sc-icon"><svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div><span class="sc-label">Add shortcut</span>';
+  frag.appendChild(add);
+  scGrid.textContent='';
+  scGrid.appendChild(frag);
 
   // Add button click
   document.getElementById('scAddBtn').onclick=function(){editIdx=-1;openScDialog('Add shortcut','','')};
@@ -804,29 +827,63 @@ function render(items){
     if(!groups[key])groups[key]={label:formatDate(it.time),items:[]};
     groups[key].items.push(it);
   });
-  var html='';
+  // Titles and URLs are attacker-controlled: build nodes, never innerHTML.
+  var frag=document.createDocumentFragment();
   Object.keys(groups).forEach(function(key){
     var g=groups[key];
-    html+='<div class="day-label">'+g.label+'</div>';
+    var lbl=document.createElement('div');
+    lbl.className='day-label';
+    lbl.textContent=g.label;
+    frag.appendChild(lbl);
     g.items.forEach(function(it,i){
-      var fav=getFavicon(it.url);
-      html+='<div class="item" data-url="'+it.url.replace(/"/g,'&quot;')+'">';
-      html+='<div class="item-icon"><img src="'+fav+'" onerror="this.style.display=\'none\'"></div>';
-      html+='<div class="item-body"><div class="item-title">'+(it.title||it.url)+'</div>';
-      html+='<div class="item-url">'+it.url+'</div></div>';
-      html+='<span class="item-time">'+formatTime(it.time)+'</span>';
-      html+='<button class="item-delete" data-idx="'+i+'" title="Remove">';
-      html+='<svg width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
-      html+='</button></div>';
+      var row=document.createElement('div');
+      row.className='item';
+      row.dataset.url=it.url;
+
+      var icon=document.createElement('div');
+      icon.className='item-icon';
+      var img=document.createElement('img');
+      img.src=getFavicon(it.url);
+      img.onerror=function(){this.style.display='none';};
+      icon.appendChild(img);
+
+      var body=document.createElement('div');
+      body.className='item-body';
+      var title=document.createElement('div');
+      title.className='item-title';
+      title.textContent=it.title||it.url;
+      var urlEl=document.createElement('div');
+      urlEl.className='item-url';
+      urlEl.textContent=it.url;
+      body.appendChild(title);
+      body.appendChild(urlEl);
+
+      var time=document.createElement('span');
+      time.className='item-time';
+      time.textContent=formatTime(it.time);
+
+      var del=document.createElement('button');
+      del.className='item-delete';
+      del.dataset.idx=i;
+      del.title='Remove';
+      del.innerHTML='<svg width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
+      row.appendChild(icon);
+      row.appendChild(body);
+      row.appendChild(time);
+      row.appendChild(del);
+      frag.appendChild(row);
     });
   });
-  list.innerHTML=html;
+  list.textContent='';
+  list.appendChild(frag);
 
-  // Click to navigate
+  // Click to navigate — only ever to a real web URL
   list.querySelectorAll('.item').forEach(function(el){
     el.onclick=function(e){
       if(e.target.closest('.item-delete'))return;
-      location.href=el.dataset.url;
+      var u=el.dataset.url||'';
+      if(/^https?:\/\//i.test(u)) location.href=u;
     };
   });
 }
@@ -972,25 +1029,54 @@ function render(){
     return;
   }
   document.getElementById('count').textContent=items.length+' files';
-  var html='';
+  // dl.name comes from the server's Content-Disposition: never innerHTML.
+  var frag=document.createDocumentFragment();
   items.forEach(function(dl){
     var color=getFileIcon(dl.name);
     var statusClass=dl.complete?'done':(dl.percent>=0?'active':'failed');
     var statusText=dl.complete?'Done':(dl.percent>=0?dl.percent+'%':'Failed');
-    html+='<div class="dl-item">';
-    html+='<div class="dl-icon" style="color:'+color+'">';
-    html+='<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><rect x="4" y="2" width="12" height="16" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M8 7h4M8 10h4M8 13h2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
-    html+='</div>';
-    html+='<div class="dl-body"><div class="dl-name">'+dl.name+'</div>';
-    html+='<div class="dl-info"><span>'+formatSize(dl.size)+'</span></div>';
+
+    var row=document.createElement('div');
+    row.className='dl-item';
+
+    var icon=document.createElement('div');
+    icon.className='dl-icon';
+    icon.style.color=color;
+    icon.innerHTML='<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><rect x="4" y="2" width="12" height="16" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M8 7h4M8 10h4M8 13h2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
+
+    var body=document.createElement('div');
+    body.className='dl-body';
+    var nameEl=document.createElement('div');
+    nameEl.className='dl-name';
+    nameEl.textContent=dl.name;
+    var info=document.createElement('div');
+    info.className='dl-info';
+    var size=document.createElement('span');
+    size.textContent=formatSize(dl.size);
+    info.appendChild(size);
+    body.appendChild(nameEl);
+    body.appendChild(info);
     if(!dl.complete&&dl.percent>=0){
-      html+='<div class="dl-progress"><div class="dl-progress-fill" style="width:'+dl.percent+'%"></div></div>';
+      var bar=document.createElement('div');
+      bar.className='dl-progress';
+      var fill=document.createElement('div');
+      fill.className='dl-progress-fill';
+      fill.style.width=Math.max(0,Math.min(100,dl.percent))+'%';
+      bar.appendChild(fill);
+      body.appendChild(bar);
     }
-    html+='</div>';
-    html+='<span class="dl-status '+statusClass+'">'+statusText+'</span>';
-    html+='</div>';
+
+    var status=document.createElement('span');
+    status.className='dl-status '+statusClass;
+    status.textContent=statusText;
+
+    row.appendChild(icon);
+    row.appendChild(body);
+    row.appendChild(status);
+    frag.appendChild(row);
   });
-  list.innerHTML=html;
+  list.textContent='';
+  list.appendChild(frag);
 }
 
 function formatSize(bytes){
@@ -1184,6 +1270,21 @@ collect();
 
     if (path.empty()) path = "index.html";
 
+    // Containment: the chrome UI is a fixed set of files shipped next to the
+    // binary. Accept only simple relative names and never rely on the URL
+    // canonicaliser having removed dot segments for us.
+    bool safe = path[0] != '/' && path.find("..") == std::string::npos;
+    if (safe) {
+        for (char c : path) {
+            const unsigned char u = static_cast<unsigned char>(c);
+            const bool ok = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
+                            (u >= '0' && u <= '9') ||
+                            c == '.' || c == '_' || c == '-' || c == '/';
+            if (!ok) { safe = false; break; }
+        }
+    }
+    if (!safe) return new OrbResourceHandler(std::string());
+
     std::string file_path = ui_dir_ + "/" + path;
     return new OrbResourceHandler(file_path);
 }
@@ -1206,7 +1307,8 @@ bool OrbResourceHandler::Open(CefRefPtr<CefRequest> request,
     std::ifstream file(file_path_, std::ios::binary);
     if (!file.is_open()) {
         handle_request = true;
-        data_ = "<html><body><h1>404 - File not found</h1><p>" + file_path_ + "</p></body></html>";
+        status_ = 404;
+        data_ = "<!DOCTYPE html><html><body><h1>404 - Not found</h1></body></html>";
         mime_type_ = "text/html";
         return true;
     }
@@ -1223,7 +1325,20 @@ void OrbResourceHandler::GetResponseHeaders(CefRefPtr<CefResponse> response,
                                              int64_t& response_length,
                                              CefString& redirect_url) {
     response->SetMimeType(mime_type_);
-    response->SetStatus(200);
+    response->SetStatus(status_);
+
+    // orb:// documents are privileged (they can use the cefQuery bridge), so
+    // they must not be able to pull in or talk to anything off-origin.
+    CefResponse::HeaderMap headers;
+    headers.insert(std::make_pair("Content-Security-Policy",
+        "default-src 'none'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; "
+        "font-src 'self' data:; connect-src 'none'; frame-ancestors 'none'; "
+        "form-action 'none'; base-uri 'none'"));
+    headers.insert(std::make_pair("X-Content-Type-Options", "nosniff"));
+    headers.insert(std::make_pair("Referrer-Policy", "no-referrer"));
+    response->SetHeaderMap(headers);
+
     response_length = static_cast<int64_t>(data_.size());
 }
 

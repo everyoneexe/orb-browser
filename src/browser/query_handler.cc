@@ -123,17 +123,30 @@ void WriteFileJson(const std::string& path, const std::string& json) {
     f << json;
 }
 
-// Escape string for JSON
+// Escape string for JSON. Control characters must be \u-escaped or the file
+// we write back is not parseable and every consumer silently falls back to [].
 std::string JsonEscape(const std::string& s) {
     std::string out;
-    for (char c : s) {
+    out.reserve(s.size() + 8);
+    for (char ch : s) {
+        const unsigned char c = static_cast<unsigned char>(ch);
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
-            default:   out += c; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                if (c < 0x20 || c == 0x7F) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04X", c);
+                    out += buf;
+                } else {
+                    out += ch;
+                }
+                break;
         }
     }
     return out;
@@ -143,6 +156,104 @@ std::string GetPinnedPath() {
     const char* home = getenv("HOME");
     if (!home) home = "/tmp";
     return std::string(home) + "/.config/orb-browser/pinned.json";
+}
+
+void WriteSystemClipboard(const std::string& text) {
+    GtkClipboard* clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(clip, text.c_str(), static_cast<gint>(text.length()));
+    gtk_clipboard_store(clip);
+}
+
+// The cefQuery bridge is privileged: it reads and writes history, bookmarks,
+// settings and tab state. Only documents we serve ourselves may use it.
+bool IsTrustedFrame(CefRefPtr<CefFrame> frame) {
+    if (!frame) return false;
+    const std::string url = frame->GetURL().ToString();
+    return url.rfind("orb://", 0) == 0;
+}
+
+// settingsSave is reachable from the chrome UI, so it is a key/value store the
+// UI may write — not an arbitrary config writer. downloadDir in particular is
+// only settable through setDownloadDir, which asks the user with a chooser.
+bool IsAllowedSetting(const std::string& key, const std::string& value) {
+    if (key == "searchEngine") {
+        return value == "google" || value == "duckduckgo" ||
+               value == "bing" || value == "brave";
+    }
+    return false;
+}
+
+bool IsRecordableHistoryUrl(const std::string& url) {
+    return url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0;
+}
+
+// Single implementation of "write key into settings.json"; both settingsSave
+// and the download-directory chooser used to carry their own copy.
+void UpsertSetting(const std::string& key, const std::string& value) {
+    std::string data = ReadFileJson(GetSettingsPath());
+    if (data.empty() || data == "[]") data = "{}";
+
+    const std::string search = "\"" + key + "\"";
+    const auto pos = data.find(search);
+    if (pos != std::string::npos) {
+        const auto colon = data.find(':', pos + search.size());
+        if (colon == std::string::npos) return;  // malformed: do not corrupt it
+        auto vstart = colon + 1;
+        while (vstart < data.size() && (data[vstart] == ' ' || data[vstart] == '\t')) vstart++;
+        if (vstart >= data.size()) return;
+        size_t vend;
+        if (data[vstart] == '"') {
+            vend = data.find('"', vstart + 1);
+            if (vend == std::string::npos) return;
+            vend++;
+        } else {
+            vend = data.find_first_of(",}", vstart);
+            if (vend == std::string::npos) return;
+        }
+        data.replace(vstart, vend - vstart, "\"" + JsonEscape(value) + "\"");
+    } else if (data.back() == '}') {
+        data.pop_back();
+        if (data.size() > 1) data += ",";
+        data += "\"" + JsonEscape(key) + "\":\"" + JsonEscape(value) + "\"}";
+    } else {
+        data = "{\"" + JsonEscape(key) + "\":\"" + JsonEscape(value) + "\"}";
+    }
+    WriteFileJson(GetSettingsPath(), data);
+}
+
+// The folder chooser answers the query from its "response" signal.
+// gtk_dialog_run() would spin a nested main loop on the CEF UI thread and
+// freeze every tab until the user replies.
+struct DownloadDirRequest {
+    CefRefPtr<CefMessageRouterBrowserSide::Handler::Callback> callback;
+    bool answered = false;
+};
+
+void OnDownloadDirResponse(GtkDialog* dialog, gint response, gpointer data) {
+    auto* req = static_cast<DownloadDirRequest*>(data);
+    if (!req->answered) {
+        req->answered = true;
+        char* folder = (response == GTK_RESPONSE_ACCEPT)
+            ? gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog))
+            : nullptr;
+        if (folder) {
+            UpsertSetting("downloadDir", folder);
+            req->callback->Success("{\"dir\":\"" + JsonEscape(folder) + "\"}");
+            g_free(folder);
+        } else {
+            req->callback->Success("{}");
+        }
+    }
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+void OnDownloadDirDestroy(GtkWidget* widget, gpointer data) {
+    auto* req = static_cast<DownloadDirRequest*>(data);
+    if (!req->answered) {
+        req->answered = true;
+        req->callback->Success("{}");
+    }
+    delete req;
 }
 
 }  // namespace
@@ -158,6 +269,20 @@ bool OrbQueryHandler::OnQuery(CefRefPtr<CefBrowser> browser,
                                CefRefPtr<Callback> callback) {
     std::string json = request.ToString();
     std::string cmd = GetJsonString(json, "cmd");
+
+    if (!IsTrustedFrame(frame)) {
+        // Untrusted web content gets exactly one capability: handing back its
+        // own selection for a copy/cut the browser process itself initiated.
+        CefRefPtr<BrowserClient> client = window_ ? window_->GetClient() : nullptr;
+        if (cmd == "clipboardWrite" && browser && client &&
+            client->ConsumeClipboardToken(browser->GetIdentifier())) {
+            WriteSystemClipboard(GetJsonString(json, "text"));
+            callback->Success("{}");
+        } else {
+            callback->Failure(403, "orb bridge is not available to this origin");
+        }
+        return true;
+    }
 
     if (cmd == "newTab") {
         std::string url = GetJsonString(json, "url");
@@ -347,7 +472,10 @@ bool OrbQueryHandler::OnQuery(CefRefPtr<CefBrowser> browser,
     if (cmd == "historyAdd") {
         std::string url = GetJsonString(json, "url");
         std::string title = GetJsonString(json, "title");
-        if (url.empty() || url.find("orb://") == 0) {
+        // Only real web navigations are recorded. Anything else (javascript:,
+        // data:, blob:, orb:) would be re-activated by a click on the history
+        // page, which runs in a privileged origin.
+        if (!IsRecordableHistoryUrl(url)) {
             callback->Success("{}");
             return true;
         }
@@ -402,34 +530,11 @@ bool OrbQueryHandler::OnQuery(CefRefPtr<CefBrowser> browser,
     if (cmd == "settingsSave") {
         std::string key = GetJsonString(json, "key");
         std::string value = GetJsonString(json, "value");
-        // Simple key-value store
-        std::string data = ReadFileJson(GetSettingsPath());
-        if (data == "[]") data = "{}";
-        // Check if key exists, update or add
-        std::string search = "\"" + key + "\"";
-        auto pos = data.find(search);
-        if (pos != std::string::npos) {
-            // Replace value
-            auto colon = data.find(':', pos);
-            if (colon != std::string::npos) {
-                auto vstart = colon + 1;
-                while (vstart < data.size() && data[vstart] == ' ') vstart++;
-                auto vend = data.find_first_of(",}", vstart);
-                if (data[vstart] == '"') {
-                    vend = data.find('"', vstart + 1);
-                    if (vend != std::string::npos) vend++;
-                }
-                data.replace(vstart, vend - vstart, "\"" + JsonEscape(value) + "\"");
-            }
-        } else {
-            // Add new key
-            if (data.size() > 1 && data.back() == '}') {
-                data.pop_back();
-                if (data.size() > 1) data += ",";
-                data += "\"" + JsonEscape(key) + "\":\"" + JsonEscape(value) + "\"}";
-            }
+        if (!IsAllowedSetting(key, value)) {
+            callback->Failure(400, "unknown setting");
+            return true;
         }
-        WriteFileJson(GetSettingsPath(), data);
+        UpsertSetting(key, value);
         callback->Success("{}");
         return true;
     }
@@ -598,61 +703,34 @@ bool OrbQueryHandler::OnQuery(CefRefPtr<CefBrowser> browser,
     }
 
     if (cmd == "setDownloadDir") {
-        // Open GTK folder chooser dialog on main thread
-        if (window_) {
-            GtkWidget* win = window_->GetMainWindow();
-            GtkWidget* dialog = gtk_file_chooser_dialog_new(
-                "Choose Download Directory",
-                GTK_WINDOW(win),
-                GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
-                "_Cancel", GTK_RESPONSE_CANCEL,
-                "_Select", GTK_RESPONSE_ACCEPT,
-                nullptr);
-
-            // Set current download dir as default
-            std::string settings = ReadFileJson(GetSettingsPath());
-            if (settings != "[]" && settings != "{}") {
-                std::string current = GetJsonString(settings, "downloadDir");
-                if (!current.empty()) {
-                    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog), current.c_str());
-                }
-            }
-
-            if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
-                char* folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
-                if (folder) {
-                    // Save to settings
-                    std::string data = ReadFileJson(GetSettingsPath());
-                    if (data == "[]") data = "{}";
-                    std::string search = "\"downloadDir\"";
-                    auto pos = data.find(search);
-                    if (pos != std::string::npos) {
-                        auto colon = data.find(':', pos);
-                        auto vstart = colon + 1;
-                        while (vstart < data.size() && data[vstart] == ' ') vstart++;
-                        auto vend = data.find_first_of(",}", vstart);
-                        if (data[vstart] == '"') { vend = data.find('"', vstart + 1); if (vend != std::string::npos) vend++; }
-                        data.replace(vstart, vend - vstart, "\"" + JsonEscape(folder) + "\"");
-                    } else {
-                        if (data.back() == '}') {
-                            data.pop_back();
-                            if (data.size() > 1) data += ",";
-                            data += "\"downloadDir\":\"" + JsonEscape(folder) + "\"}";
-                        }
-                    }
-                    WriteFileJson(GetSettingsPath(), data);
-                    callback->Success("{\"dir\":\"" + JsonEscape(folder) + "\"}");
-                    g_free(folder);
-                } else {
-                    callback->Success("{}");
-                }
-            } else {
-                callback->Success("{}");
-            }
-            gtk_widget_destroy(dialog);
-        } else {
+        if (!window_) {
             callback->Failure(1, "No window");
+            return true;
         }
+
+        GtkWidget* win = window_->GetMainWindow();
+        GtkWidget* dialog = gtk_file_chooser_dialog_new(
+            "Choose Download Directory",
+            GTK_WINDOW(win),
+            GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+            "_Cancel", GTK_RESPONSE_CANCEL,
+            "_Select", GTK_RESPONSE_ACCEPT,
+            nullptr);
+
+        // Set current download dir as default
+        const std::string settings = ReadFileJson(GetSettingsPath());
+        if (settings != "[]" && settings != "{}") {
+            const std::string current = GetJsonString(settings, "downloadDir");
+            if (!current.empty()) {
+                gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog), current.c_str());
+            }
+        }
+
+        auto* pending = new DownloadDirRequest{callback, false};
+        g_signal_connect(dialog, "response", G_CALLBACK(OnDownloadDirResponse), pending);
+        g_signal_connect(dialog, "destroy", G_CALLBACK(OnDownloadDirDestroy), pending);
+        gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+        gtk_widget_show_all(dialog);
         return true;
     }
 
@@ -711,6 +789,39 @@ bool OrbQueryHandler::OnQuery(CefRefPtr<CefBrowser> browser,
             }
             WriteFileJson(GetPinnedPath(), data);
         }
+        callback->Success("{}");
+        return true;
+    }
+
+    if (cmd == "clipboardWrite") {
+        WriteSystemClipboard(GetJsonString(json, "text"));
+        callback->Success("{}");
+        return true;
+    }
+
+    if (cmd == "sidebarWidth") {
+        int width = GetJsonInt(json, "width");
+        if (width > 0 && width <= 400) {
+            BrowserWindow::kSidebarWidth = width;
+            auto* win = BrowserWindow::GetInstance();
+            if (win) win->ForceResize();
+        }
+        callback->Success("{}");
+        return true;
+    }
+
+    if (cmd == "splitView") {
+        int tab_id = GetJsonInt(json, "tabId");
+        bool horizontal = !GetJsonBool(json, "vertical");
+        auto* win = BrowserWindow::GetInstance();
+        if (win) win->SetSplitView(tab_id, horizontal);
+        callback->Success("{}");
+        return true;
+    }
+
+    if (cmd == "splitViewClose") {
+        auto* win = BrowserWindow::GetInstance();
+        if (win) win->CloseSplitView();
         callback->Success("{}");
         return true;
     }

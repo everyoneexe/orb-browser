@@ -9,16 +9,18 @@ int main(int argc, char* argv[]) {
     // Force X11 backend — CEF requires X11 on Linux
     setenv("GDK_BACKEND", "x11", 1);
 
-    // Init GTK
-    gtk_init(&argc, &argv);
-
     CefMainArgs main_args(argc, argv);
     CefRefPtr<BrowserApp> app(new BrowserApp);
 
+    // Subprocesses (renderer, utility, GPU) must exit here.
+    // GTK init MUST come after this — subprocesses hang on gtk_init.
     int exit_code = CefExecuteProcess(main_args, app, nullptr);
     if (exit_code >= 0) {
         return exit_code;
     }
+
+    // Only the browser process reaches here — safe to init GTK
+    gtk_init(&argc, &argv);
 
     // Persistent cache path for Widevine registration etc.
     std::string cache_path;
@@ -35,6 +37,7 @@ int main(int argc, char* argv[]) {
     settings.windowless_rendering_enabled = true;
     CefString(&settings.locale).FromASCII("en-US");
     CefString(&settings.root_cache_path).FromString(cache_path);
+    CefString(&settings.cache_path).FromString(cache_path + "/Default");
 
     if (!CefInitialize(main_args, settings, app, nullptr)) {
         return 1;

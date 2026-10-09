@@ -17,11 +17,18 @@ BrowserApp::BrowserApp() {}
 void BrowserApp::OnBeforeCommandLineProcessing(
     const CefString& process_type,
     CefRefPtr<CefCommandLine> command_line) {
-    // OSR handles its own compositing, but allow GPU for WebGL etc.
+    // OSR: disable GPU display compositing (OnPaint bitmap rendering)
     command_line->AppendSwitch("disable-gpu-compositing");
+    // GPU must run in-process (no separate GPU binary)
     command_line->AppendSwitch("in-process-gpu");
-    // Single-process: renderer runs in-process (avoids subprocess crashes)
-    command_line->AppendSwitch("single-process");
+    // DO NOT use single-process — Widevine CDM requires a separate
+    // utility process for decryption.
+
+    // Allow autoplay for live streams (YouTube starts playback without gesture)
+    command_line->AppendSwitchWithValue("autoplay-policy",
+                                        "no-user-gesture-required");
+    // Enable media stream APIs (YouTube live checks for these)
+    command_line->AppendSwitch("enable-media-stream");
 }
 
 void BrowserApp::OnRegisterCustomSchemes(CefRawPtr<CefSchemeRegistrar> registrar) {
@@ -69,6 +76,36 @@ void BrowserApp::OnContextCreated(CefRefPtr<CefBrowser> browser,
         renderer_message_router_ = CefMessageRouterRendererSide::Create(config);
     }
     renderer_message_router_->OnContextCreated(browser, frame, context);
+
+    // Force VP9/Opus on all pages — H264/AAC not available in this CEF build.
+    // Must run before any page JS to override codec checks.
+    std::string vp9_fix = R"(
+        (function(){
+            if (typeof MediaSource === 'undefined') return;
+            var orig = MediaSource.isTypeSupported.bind(MediaSource);
+            MediaSource.isTypeSupported = function(type) {
+                var dominated = type.indexOf('avc1') !== -1;
+                var result = dominated ? false : orig(type);
+                console.log('[CODEC] isTypeSupported(' + type + ') → ' + result + (dominated ? ' [blocked → use VP9]' : ''));
+                return result;
+            };
+
+            if (navigator.requestMediaKeySystemAccess) {
+                var origEME = navigator.requestMediaKeySystemAccess.bind(navigator);
+                navigator.requestMediaKeySystemAccess = function(keySystem, configs) {
+                    console.log('[CODEC] requestMediaKeySystemAccess(' + keySystem + ') configs:', JSON.stringify(configs));
+                    return origEME(keySystem, configs).then(function(access) {
+                        console.log('[CODEC] EME OK: ' + keySystem);
+                        return access;
+                    }).catch(function(e) {
+                        console.log('[CODEC] EME FAIL: ' + keySystem + ' - ' + e.message);
+                        throw e;
+                    });
+                };
+            }
+        })();
+    )";
+    frame->ExecuteJavaScript(vp9_fix, "orb://internal", 0);
 }
 
 void BrowserApp::OnContextReleased(CefRefPtr<CefBrowser> browser,

@@ -1,31 +1,28 @@
 #include "browser/browser_client.h"
 #include "browser/browser_window.h"
+#include "browser/js_escape.h"
 #include "browser/query_handler.h"
 #include "include/cef_app.h"
 #include "include/wrapper/cef_helpers.h"
 
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <fstream>
+#include <climits>
+#include <cstdlib>
 #include <sys/stat.h>
+#include <chrono>
 #include <gtk/gtk.h>
 
 namespace {
-// Escape a string for safe insertion into a JS single-quoted string literal
-std::string JsEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s) {
-        switch (c) {
-            case '\'': out += "\\'"; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            default:   out += c; break;
-        }
-    }
-    return out;
+
+int64_t NowMillis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
+
 std::string ExtractDomain(const std::string& url) {
     auto spos = url.find("://");
     if (spos == std::string::npos) return "";
@@ -94,6 +91,66 @@ void SaveDomainZoom(const std::string& domain, double zoom) {
     f << data;
 }
 
+// Keep only a file name: no directory components, no traversal, no control
+// characters, and no leading dot (a hostile name must not land on a dotfile).
+std::string SanitizeDownloadName(const std::string& suggested) {
+    std::string name = suggested;
+    auto slash = name.find_last_of('/');
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7F || c == '/' || c == '\\') continue;
+        out += c;
+    }
+    while (!out.empty() && (out.front() == '.' || out.front() == ' ')) out.erase(out.begin());
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.empty()) out = "download";
+    if (out.size() > 200) out.resize(200);
+    return out;
+}
+
+// The download directory is user state, never page state: it must be an
+// existing directory inside $HOME. Anything else falls back to ~/Downloads.
+std::string ResolveDownloadDir(const std::string& configured, const std::string& home) {
+    const std::string fallback = home + "/Downloads";
+    if (configured.empty() || configured[0] != '/') return fallback;
+
+    char resolved[PATH_MAX];
+    char home_resolved[PATH_MAX];
+    if (!realpath(configured.c_str(), resolved)) return fallback;
+    if (!realpath(home.c_str(), home_resolved)) return fallback;
+
+    struct stat st;
+    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) return fallback;
+
+    const std::string dir(resolved);
+    const std::string root(home_resolved);
+    if (dir != root && dir.rfind(root + "/", 0) != 0) return fallback;
+    return dir;
+}
+
+// Never silently overwrite an existing file.
+std::string UniqueDownloadPath(const std::string& dir, const std::string& name) {
+    struct stat st;
+    std::string path = dir + "/" + name;
+    if (stat(path.c_str(), &st) != 0) return path;
+
+    std::string stem = name, ext;
+    auto dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot != 0) {
+        stem = name.substr(0, dot);
+        ext = name.substr(dot);
+    }
+    for (int i = 1; i < 1000; i++) {
+        std::string candidate = dir + "/" + stem + " (" + std::to_string(i) + ")" + ext;
+        if (stat(candidate.c_str(), &st) != 0) return candidate;
+    }
+    return path;
+}
+
 }  // namespace
 
 BrowserClient::BrowserClient(TabManager* tab_manager,
@@ -108,6 +165,20 @@ BrowserClient::BrowserClient(TabManager* tab_manager,
     config.js_cancel_function = "cefQueryCancel";
     message_router_ = CefMessageRouterBrowserSide::Create(config);
     message_router_->AddHandler(new OrbQueryHandler(tab_manager_, window_), false);
+}
+
+void BrowserClient::ArmClipboardToken(int browser_id) {
+    CEF_REQUIRE_UI_THREAD();
+    clipboard_token_browser_ = browser_id;
+    clipboard_token_deadline_ms_ = NowMillis() + 1000;
+}
+
+bool BrowserClient::ConsumeClipboardToken(int browser_id) {
+    CEF_REQUIRE_UI_THREAD();
+    if (clipboard_token_browser_ != browser_id) return false;
+    if (NowMillis() > clipboard_token_deadline_ms_) return false;
+    clipboard_token_browser_ = -1;
+    return true;
 }
 
 bool BrowserClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
@@ -155,6 +226,10 @@ void BrowserClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
     message_router_->OnBeforeClose(browser);
     browser_count_--;
+
+    // Drop every reference the window still holds, otherwise later input is
+    // routed to a host that no longer exists.
+    if (window_) window_->OnBrowserClosed(browser);
 
     // Notify tab manager
     tab_manager_->OnBrowserClosed(browser->GetIdentifier());
@@ -211,6 +286,43 @@ void BrowserClient::OnTitleChange(CefRefPtr<CefBrowser> browser,
     }
 }
 
+bool BrowserClient::OnConsoleMessage(CefRefPtr<CefBrowser> browser,
+                                     cef_log_severity_t level,
+                                     const CefString& message,
+                                     const CefString& source,
+                                     int line) {
+    std::string prefix;
+    switch (level) {
+        case LOGSEVERITY_WARNING: prefix = "WARN"; break;
+        case LOGSEVERITY_ERROR:   prefix = "ERROR"; break;
+        default:                  prefix = "LOG"; break;
+    }
+    fprintf(stderr, "[JS %s] %s (%s:%d)\n", prefix.c_str(),
+            message.ToString().c_str(), source.ToString().c_str(), line);
+    return false;
+}
+
+void BrowserClient::OnFullscreenModeChange(CefRefPtr<CefBrowser> browser,
+                                           bool fullscreen) {
+    if (!window_) return;
+    GtkWidget* win = window_->GetMainWindow();
+    if (!win) return;
+
+    if (fullscreen) {
+        // Hide sidebar and titlebar, go fullscreen
+        window_->sidebar_visible_ = false;
+        BrowserWindow::kSidebarWidth = 0;
+        gtk_window_fullscreen(GTK_WINDOW(win));
+    } else {
+        gtk_window_unfullscreen(GTK_WINDOW(win));
+        if (window_->sidebar_pinned_) {
+            window_->sidebar_visible_ = true;
+            BrowserWindow::kSidebarWidth = BrowserWindow::kDefaultSidebarWidth;
+        }
+    }
+    window_->ForceResize();
+}
+
 CefRefPtr<CefResourceRequestHandler> BrowserClient::GetResourceRequestHandler(
     CefRefPtr<CefBrowser> browser,
     CefRefPtr<CefFrame> frame,
@@ -222,6 +334,40 @@ CefRefPtr<CefResourceRequestHandler> BrowserClient::GetResourceRequestHandler(
     return request_filter_;
 }
 
+// Pasting must not spin a nested GTK loop on the CEF UI thread: ask for the
+// selection asynchronously and inject it when the owner answers.
+namespace {
+
+struct PasteRequest {
+    CefRefPtr<CefBrowser> browser;
+};
+
+void OnClipboardTextReceived(GtkClipboard* clipboard, const gchar* text, gpointer data) {
+    std::unique_ptr<PasteRequest> req(static_cast<PasteRequest*>(data));
+    if (!text || !req->browser) return;
+
+    auto focused = req->browser->GetFocusedFrame();
+    if (!focused) return;
+
+    const std::string escaped = JsEscape(text);
+    focused->ExecuteJavaScript(
+        "(function(){"
+        "  var el = document.activeElement;"
+        "  var txt = '" + escaped + "';"
+        "  if(el && (el.tagName==='INPUT'||el.tagName==='TEXTAREA')){"
+        "    var start=el.selectionStart||0, end=el.selectionEnd||0;"
+        "    el.value = el.value.substring(0,start) + txt + el.value.substring(end);"
+        "    el.selectionStart = el.selectionEnd = start + txt.length;"
+        "    el.dispatchEvent(new Event('input',{bubbles:true}));"
+        "  } else if(el && el.isContentEditable){"
+        "    document.execCommand('insertText',false,txt);"
+        "  }"
+        "})();",
+        "", 0);
+}
+
+}  // namespace
+
 bool BrowserClient::OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
                                   const CefKeyEvent& event,
                                   CefEventHandle os_event,
@@ -230,6 +376,13 @@ bool BrowserClient::OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
 
     bool ctrl = (event.modifiers & EVENTFLAG_CONTROL_DOWN) != 0;
     bool shift = (event.modifiers & EVENTFLAG_SHIFT_DOWN) != 0;
+    bool alt = (event.modifiers & EVENTFLAG_ALT_DOWN) != 0;
+
+    // Alt+D: Show floating URL bar on active tab
+    if (alt && event.windows_key_code == 'D') {
+        ShowFloatingUrlBar();
+        return true;
+    }
 
     // F11: Fullscreen toggle
     if (event.windows_key_code == 0x7A) {  // VK_F11
@@ -359,20 +512,55 @@ bool BrowserClient::OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
         }
 
         switch (event.windows_key_code) {
-            case 'C': {  // Ctrl+C: Copy
-                browser->GetFocusedFrame()->Copy();
-                return false;  // Also let CEF process it
-            }
-            case 'V': {  // Ctrl+V: Paste
-                browser->GetFocusedFrame()->Paste();
+            case 'C': {  // Ctrl+C: Copy to system clipboard
+                auto focused = browser->GetFocusedFrame();
+                if (!focused) return false;
+                // The page itself hands the selection back through cefQuery;
+                // allow exactly one such call for this user-initiated copy.
+                ArmClipboardToken(browser->GetIdentifier());
+                focused->ExecuteJavaScript(
+                    "(function(){"
+                    "  var s = window.getSelection().toString();"
+                    "  if(!s) {"
+                    "    var el = document.activeElement;"
+                    "    if(el && (el.tagName==='INPUT'||el.tagName==='TEXTAREA') && "
+                    "       typeof el.selectionStart==='number' && el.selectionStart !== el.selectionEnd)"
+                    "      s = el.value.substring(el.selectionStart, el.selectionEnd);"
+                    "  }"
+                    "  if(s && typeof cefQuery==='function') cefQuery({request:JSON.stringify({cmd:'clipboardWrite',text:s})});"
+                    "})();",
+                    "", 0);
+                focused->Copy();
                 return false;
             }
-            case 'X': {  // Ctrl+X: Cut
-                browser->GetFocusedFrame()->Cut();
+            case 'V': {  // Ctrl+V: Paste from system clipboard
+                GtkClipboard* clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+                gtk_clipboard_request_text(clip, OnClipboardTextReceived,
+                                           new PasteRequest{browser});
+                return true;
+            }
+            case 'X': {  // Ctrl+X: Cut to system clipboard
+                auto focused = browser->GetFocusedFrame();
+                if (!focused) return false;
+                ArmClipboardToken(browser->GetIdentifier());
+                focused->ExecuteJavaScript(
+                    "(function(){"
+                    "  var s = window.getSelection().toString();"
+                    "  if(!s) {"
+                    "    var el = document.activeElement;"
+                    "    if(el && (el.tagName==='INPUT'||el.tagName==='TEXTAREA') && "
+                    "       typeof el.selectionStart==='number' && el.selectionStart !== el.selectionEnd)"
+                    "      s = el.value.substring(el.selectionStart, el.selectionEnd);"
+                    "  }"
+                    "  if(s && typeof cefQuery==='function') cefQuery({request:JSON.stringify({cmd:'clipboardWrite',text:s})});"
+                    "})();",
+                    "", 0);
+                focused->Cut();
                 return false;
             }
             case 'A': {  // Ctrl+A: Select All
-                browser->GetFocusedFrame()->SelectAll();
+                auto focused = browser->GetFocusedFrame();
+                if (focused) focused->SelectAll();
                 return false;
             }
             case 'T': {  // Ctrl+T: New tab (let sidebar JS decide URL)
@@ -383,15 +571,21 @@ bool BrowserClient::OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
             case 'W':  // Ctrl+W: Close tab
                 tab_manager_->CloseActiveTab();
                 return true;
-            case 'L':  // Ctrl+L: Focus address bar
-                NotifySidebar("if(typeof orb !== 'undefined') orb.focusAddressBar();");
+            case 'L':  // Ctrl+L: Show floating URL bar
+                ShowFloatingUrlBar();
                 return true;
             case 'D':  // Ctrl+D: Toggle bookmark
                 NotifySidebar("if(typeof orb !== 'undefined') orb.toggleBookmark();");
                 return true;
-            case 'B':  // Ctrl+B: Toggle sidebar pin
-            case 'S':  // Ctrl+S: Toggle sidebar pin
-                if (window_) window_->ToggleSidebar();
+            case 'B':  // Ctrl+B: Toggle compact mode
+                NotifySidebar("if(typeof toggleCompactMode==='function') toggleCompactMode();");
+                return true;
+            case 'S':  // Ctrl+S: Toggle sidebar pin / Ctrl+Shift+S: Close split view
+                if (shift) {
+                    if (window_) window_->CloseSplitView();
+                } else {
+                    if (window_) window_->ToggleSidebar();
+                }
                 return true;
             case 0x09:  // Ctrl+Tab: Next tab (without shift)
                 if (!shift) {
@@ -489,8 +683,21 @@ void BrowserClient::OnBeforeContextMenu(CefRefPtr<CefBrowser> browser,
 // Context for GTK popup menu
 struct GtkMenuContext {
     CefRefPtr<CefRunContextMenuCallback> callback;
-    bool handled = false;
+    GtkWidget* menu = nullptr;
+    bool handled = false;  // a command was chosen
+    bool closed = false;   // cleanup already scheduled
 };
+
+static gboolean FinishGtkMenu(gpointer data) {
+    auto* ctx = static_cast<GtkMenuContext*>(data);
+    if (!ctx->handled) ctx->callback->Cancel();
+    if (ctx->menu) {
+        gtk_widget_destroy(ctx->menu);
+        g_object_unref(ctx->menu);
+    }
+    delete ctx;
+    return G_SOURCE_REMOVE;
+}
 
 static void OnGtkMenuItem(GtkWidget* widget, gpointer data) {
     auto* ctx = static_cast<GtkMenuContext*>(data);
@@ -503,15 +710,12 @@ static void OnGtkMenuItem(GtkWidget* widget, gpointer data) {
 
 static void OnGtkMenuDeactivate(GtkMenuShell* shell, gpointer data) {
     auto* ctx = static_cast<GtkMenuContext*>(data);
-    // Use idle callback so menu item activate fires first
-    g_idle_add([](gpointer data) -> gboolean {
-        auto* ctx = static_cast<GtkMenuContext*>(data);
-        if (!ctx->handled) {
-            ctx->callback->Cancel();
-        }
-        delete ctx;
-        return G_SOURCE_REMOVE;
-    }, ctx);
+    // GTK can emit "deactivate" more than once for the same shell; the old
+    // code deleted the context on each one.
+    if (ctx->closed) return;
+    ctx->closed = true;
+    // Idle so that a menu item's "activate" is delivered first.
+    g_idle_add(FinishGtkMenu, ctx);
 }
 
 bool BrowserClient::RunContextMenu(CefRefPtr<CefBrowser> browser,
@@ -526,8 +730,10 @@ bool BrowserClient::RunContextMenu(CefRefPtr<CefBrowser> browser,
         return true;
     }
 
-    auto* ctx = new GtkMenuContext{callback, false};
+    auto* ctx = new GtkMenuContext{callback, nullptr, false, false};
     GtkWidget* menu = gtk_menu_new();
+    g_object_ref_sink(menu);
+    ctx->menu = menu;
 
     for (size_t i = 0; i < model->GetCount(); i++) {
         cef_menu_item_type_t type = model->GetTypeAt(i);
@@ -552,44 +758,31 @@ bool BrowserClient::RunContextMenu(CefRefPtr<CefBrowser> browser,
     }
 
     g_signal_connect(menu, "deactivate", G_CALLBACK(OnGtkMenuDeactivate), ctx);
-
     gtk_widget_show_all(menu);
 
-    // Use deprecated gtk_menu_popup which doesn't need a GdkEvent
-    // The context menu coordinates are relative to the tab content area
-    // We need to convert to screen coordinates
+    // params coordinates are relative to the browser view; the popup rectangle
+    // is relative to the window's GdkWindow, so only our own chrome offsets
+    // have to be added.
     GtkWidget* main_win = window_ ? window_->GetMainWindow() : nullptr;
-    if (main_win) {
-        GdkWindow* gdk_win = gtk_widget_get_window(main_win);
-        if (gdk_win) {
-            int win_x, win_y;
-            gdk_window_get_origin(gdk_win, &win_x, &win_y);
-            // params coordinates are relative to the browser view
-            // For tab browsers, add sidebar width offset
-            int sidebar_offset = 0;
-            if (!chrome_browser_ || browser->GetIdentifier() != chrome_browser_->GetIdentifier()) {
-                sidebar_offset = BrowserWindow::kSidebarWidth;
-            }
-            int menu_x = win_x + params->GetXCoord() + sidebar_offset;
-            int menu_y = win_y + params->GetYCoord() + BrowserWindow::kTitleBarHeight;
-
-            gtk_menu_popup(GTK_MENU(menu), nullptr, nullptr,
-                [](GtkMenu* menu, gint* x, gint* y, gboolean* push_in, gpointer data) {
-                    auto* coords = static_cast<std::pair<int,int>*>(data);
-                    *x = coords->first;
-                    *y = coords->second;
-                    *push_in = TRUE;
-                },
-                new std::pair<int,int>(menu_x, menu_y),
-                3,  // right mouse button
-                gtk_get_current_event_time());
-            return true;
+    GdkWindow* gdk_win = main_win ? gtk_widget_get_window(main_win) : nullptr;
+    if (gdk_win) {
+        int sidebar_offset = 0;
+        if (!chrome_browser_ || browser->GetIdentifier() != chrome_browser_->GetIdentifier()) {
+            sidebar_offset = BrowserWindow::kSidebarWidth;
         }
+        GdkRectangle rect;
+        rect.x = params->GetXCoord() + sidebar_offset;
+        rect.y = params->GetYCoord() + BrowserWindow::kTitleBarHeight;
+        rect.width = 1;
+        rect.height = 1;
+
+        gtk_menu_attach_to_widget(GTK_MENU(menu), main_win, nullptr);
+        gtk_menu_popup_at_rect(GTK_MENU(menu), gdk_win, &rect,
+                               GDK_GRAVITY_SOUTH_EAST, GDK_GRAVITY_NORTH_WEST, nullptr);
+        return true;
     }
 
-    // Fallback: position at (0,0)
-    gtk_menu_popup(GTK_MENU(menu), nullptr, nullptr, nullptr, nullptr,
-                   3, gtk_get_current_event_time());
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), nullptr);
     return true;
 }
 
@@ -679,12 +872,77 @@ void BrowserClient::OnPaint(CefRefPtr<CefBrowser> browser,
     }
 }
 
+bool BrowserClient::OnCursorChange(CefRefPtr<CefBrowser> browser,
+                                   CefCursorHandle cursor,
+                                   cef_cursor_type_t type,
+                                   const CefCursorInfo& custom_cursor_info) {
+    if (window_) {
+        window_->SetCursor(type);
+    }
+    return true;
+}
+
 // ─── Helper ───────────────────────────────────────────────
 
 void BrowserClient::NotifySidebar(const std::string& js) {
     if (chrome_browser_ && chrome_browser_->GetMainFrame()) {
         chrome_browser_->GetMainFrame()->ExecuteJavaScript(js, "orb://chrome/", 0);
     }
+}
+
+void BrowserClient::ShowFloatingUrlBar() {
+    int active = tab_manager_->GetActiveTabId();
+    if (active < 0) return;
+    auto browser = tab_manager_->GetBrowser(active);
+    if (!browser || !browser->GetMainFrame()) return;
+
+    // Get current URL to prefill. It is page-controlled, so it must be escaped
+    // like every other value we splice into an ExecuteJavaScript payload.
+    std::string current_url = JsEscape(browser->GetMainFrame()->GetURL().ToString());
+    // Don't show internal URLs
+    if (current_url.rfind("orb://", 0) == 0) current_url = "";
+
+    std::string js = R"(
+(function(){
+    if (document.getElementById('__orb_floating_url')) {
+        document.getElementById('__orb_floating_url_input').focus();
+        document.getElementById('__orb_floating_url_input').select();
+        return;
+    }
+    var overlay = document.createElement('div');
+    overlay.id = '__orb_floating_url';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;align-items:flex-start;justify-content:center;padding-top:15vh;backdrop-filter:blur(4px);';
+    var box = document.createElement('div');
+    box.style.cssText = 'width:min(90%,700px);background:#1a1b26;border:1px solid rgba(255,255,255,0.15);border-radius:14px;box-shadow:0 30px 100px rgba(0,0,0,0.6);padding:6px;';
+    var input = document.createElement('input');
+    input.id = '__orb_floating_url_input';
+    input.type = 'text';
+    input.placeholder = 'Search or enter URL...';
+    input.value = ')" + current_url + R"(';
+    input.style.cssText = 'width:100%;height:48px;background:transparent;border:none;outline:none;color:#c0caf5;font-size:16px;font-family:inherit;padding:0 14px;';
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            var val = input.value.trim();
+            if (val) {
+                if (!/^https?:\/\//i.test(val) && !/^[a-z][a-z0-9+.-]*:/i.test(val)) {
+                    if (/^[^\s]+\.[^\s]+$/.test(val)) val = 'https://' + val;
+                    else val = 'https://www.google.com/search?q=' + encodeURIComponent(val);
+                }
+                window.location.href = val;
+            }
+            overlay.remove();
+        }
+        if (e.key === 'Escape') overlay.remove();
+    });
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+    box.appendChild(input);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    input.focus();
+    input.select();
+})();
+    )";
+    browser->GetMainFrame()->ExecuteJavaScript(js, "orb://floating-url", 0);
 }
 
 // ─── CefDownloadHandler ───────────────────────────────────
@@ -696,10 +954,10 @@ bool BrowserClient::OnBeforeDownload(CefRefPtr<CefBrowser> browser,
     CEF_REQUIRE_UI_THREAD();
 
     // Read download dir from settings, fall back to ~/Downloads
-    std::string dir;
-    const char* home = getenv("HOME");
-    if (!home) home = "/tmp";
-    std::string settings_path = std::string(home) + "/.config/orb-browser/settings.json";
+    std::string configured_dir;
+    const char* home_env = getenv("HOME");
+    const std::string home = home_env ? home_env : "/tmp";
+    std::string settings_path = home + "/.config/orb-browser/settings.json";
     {
         std::ifstream sf(settings_path);
         if (sf.good()) {
@@ -713,22 +971,22 @@ bool BrowserClient::OnBeforeDownload(CefRefPtr<CefBrowser> browser,
                 auto vstart = pos + search.length();
                 auto vend = data.find('"', vstart);
                 if (vend != std::string::npos) {
-                    dir = data.substr(vstart, vend - vstart);
+                    configured_dir = data.substr(vstart, vend - vstart);
                 }
             }
         }
     }
-    if (dir.empty()) {
-        dir = std::string(home) + "/Downloads";
-    }
-    if (dir.back() != '/') dir += '/';
+
+    std::string dir = ResolveDownloadDir(configured_dir, home);
     mkdir(dir.c_str(), 0755);
-    std::string path = dir + suggested_name.ToString();
+
+    const std::string name = SanitizeDownloadName(suggested_name.ToString());
+    const std::string path = UniqueDownloadPath(dir, name);
     callback->Continue(path, false);
 
     // Notify sidebar
     NotifySidebar("if(typeof orb !== 'undefined') orb.onDownloadStart(" +
-                  std::to_string(download_item->GetId()) + ",'" + JsEscape(suggested_name.ToString()) + "');");
+                  std::to_string(download_item->GetId()) + ",'" + JsEscape(name) + "');");
     return true;
 }
 

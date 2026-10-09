@@ -51,8 +51,31 @@ void BrowserWindow::OnSizeAllocate(GtkWidget* widget, GdkRectangle* alloc, gpoin
 
 void BrowserWindow::GetOsrRect(CefRefPtr<CefBrowser> browser, CefRect& rect) {
     if (sidebar_browser_ && browser->GetIdentifier() == sidebar_browser_->GetIdentifier()) {
-        int sw = kDefaultSidebarWidth;
+        int sw = kSidebarWidth > 0 ? kSidebarWidth : kDefaultSidebarWidth;
         rect.Set(0, 0, sw, height_ - kTitleBarHeight);
+    } else if (split_view_.active && split_view_.second_tab_id >= 0) {
+        // Split view: each panel gets a portion
+        int tw = width_ - kSidebarWidth;
+        int th = height_ - kTitleBarHeight;
+        if (tw < 1) tw = 1;
+        auto second_browser = tab_manager_.GetBrowser(split_view_.second_tab_id);
+        bool is_second = second_browser &&
+            browser->GetIdentifier() == second_browser->GetIdentifier();
+        if (split_view_.horizontal) {
+            int handle = 4;
+            int w1 = (int)(tw * split_view_.ratio) - handle / 2;
+            int w2 = tw - w1 - handle;
+            if (w1 < 1) w1 = 1;
+            if (w2 < 1) w2 = 1;
+            rect.Set(0, 0, is_second ? w2 : w1, th);
+        } else {
+            int handle = 4;
+            int h1 = (int)(th * split_view_.ratio) - handle / 2;
+            int h2 = th - h1 - handle;
+            if (h1 < 1) h1 = 1;
+            if (h2 < 1) h2 = 1;
+            rect.Set(0, 0, tw, is_second ? h2 : h1);
+        }
     } else {
         // Tab fills remaining width after sidebar
         int tw = width_ - kSidebarWidth;
@@ -67,14 +90,26 @@ void BrowserWindow::OnOsrPaint(CefRefPtr<CefBrowser> browser,
     bool is_sidebar = sidebar_browser_ &&
         browser->GetIdentifier() == sidebar_browser_->GetIdentifier();
 
+    // Check if this is the split view second panel
+    bool is_split_second = false;
+    if (!is_sidebar && split_view_.active && split_view_.second_tab_id >= 0) {
+        auto second_browser = tab_manager_.GetBrowser(split_view_.second_tab_id);
+        if (second_browser && browser->GetIdentifier() == second_browser->GetIdentifier()) {
+            is_split_second = true;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(paint_mutex_);
 
-    cairo_surface_t*& surface = is_sidebar ? sidebar_surface_ : tab_surface_;
-    int& buf_w = is_sidebar ? sidebar_buf_w_ : tab_buf_w_;
-    int& buf_h = is_sidebar ? sidebar_buf_h_ : tab_buf_h_;
+    cairo_surface_t*& surface = is_sidebar ? sidebar_surface_ :
+                                 is_split_second ? split_surface_ : tab_surface_;
+    int& buf_w = is_sidebar ? sidebar_buf_w_ :
+                  is_split_second ? split_buf_w_ : tab_buf_w_;
+    int& buf_h = is_sidebar ? sidebar_buf_h_ :
+                  is_split_second ? split_buf_h_ : tab_buf_h_;
 
-    // Only active tab gets painted
-    if (!is_sidebar) {
+    // Only active tab (and split second tab) gets painted
+    if (!is_sidebar && !is_split_second) {
         int active = tab_manager_.GetActiveTabId();
         if (active >= 0) {
             auto active_browser = tab_manager_.GetBrowser(active);
@@ -147,6 +182,38 @@ void BrowserWindow::OnOsrPaint(CefRefPtr<CefBrowser> browser,
             }
         }
     }
+}
+
+void BrowserWindow::SetCursor(cef_cursor_type_t type) {
+    if (!main_window_ || !gtk_widget_get_window(main_window_)) return;
+
+    GdkCursorType gdk_type;
+    switch (type) {
+        case CT_POINTER:     gdk_type = GDK_LEFT_PTR; break;
+        case CT_HAND:        gdk_type = GDK_HAND2; break;
+        case CT_IBEAM:       gdk_type = GDK_XTERM; break;
+        case CT_CROSS:       gdk_type = GDK_CROSSHAIR; break;
+        case CT_WAIT:        gdk_type = GDK_WATCH; break;
+        case CT_PROGRESS:    gdk_type = GDK_WATCH; break;
+        case CT_NORTHRESIZE:
+        case CT_SOUTHRESIZE:
+        case CT_NORTHSOUTHRESIZE: gdk_type = GDK_SB_V_DOUBLE_ARROW; break;
+        case CT_EASTRESIZE:
+        case CT_WESTRESIZE:
+        case CT_EASTWESTRESIZE: gdk_type = GDK_SB_H_DOUBLE_ARROW; break;
+        case CT_MOVE:        gdk_type = GDK_FLEUR; break;
+        case CT_GRAB:        gdk_type = GDK_HAND1; break;
+        case CT_GRABBING:    gdk_type = GDK_HAND1; break;
+        case CT_NOTALLOWED:  gdk_type = GDK_X_CURSOR; break;
+        case CT_COLUMNRESIZE: gdk_type = GDK_SB_H_DOUBLE_ARROW; break;
+        case CT_ROWRESIZE:   gdk_type = GDK_SB_V_DOUBLE_ARROW; break;
+        default:             gdk_type = GDK_LEFT_PTR; break;
+    }
+
+    GdkCursor* cursor = gdk_cursor_new_for_display(
+        gtk_widget_get_display(main_window_), gdk_type);
+    gdk_window_set_cursor(gtk_widget_get_window(main_window_), cursor);
+    g_object_unref(cursor);
 }
 
 gboolean BrowserWindow::OnDraw(GtkWidget* widget, cairo_t* cr, gpointer data) {
@@ -225,21 +292,87 @@ gboolean BrowserWindow::OnDraw(GtkWidget* widget, cairo_t* cr, gpointer data) {
     cairo_line_to(cr, close_cx - 3.5, dot_cy + 3.5);
     cairo_stroke(cr);
 
-    // ─── Draw tab content below titlebar, after sidebar ──
-    if (win->tab_surface_) {
-        cairo_set_source_surface(cr, win->tab_surface_, kSidebarWidth, tbh);
-        cairo_rectangle(cr, kSidebarWidth, tbh, win->tab_buf_w_, win->tab_buf_h_);
-        cairo_fill(cr);
+    // ─── Draw tab content below titlebar ──
+    // When sidebar is overlay (unpinned hover), tab starts at x=0
+    int tab_x = kSidebarWidth;
+    if (win->split_view_.active && win->split_view_.second_tab_id >= 0) {
+        // Split view: draw two panels
+        int tw = win->width_ - kSidebarWidth;
+        int th = win->height_ - tbh;
+        int handle = 4;
+
+        if (win->split_view_.horizontal) {
+            int w1 = (int)(tw * win->split_view_.ratio) - handle / 2;
+            int w2 = tw - w1 - handle;
+
+            // First panel
+            if (win->tab_surface_) {
+                cairo_set_source_surface(cr, win->tab_surface_, tab_x, tbh);
+                cairo_rectangle(cr, tab_x, tbh, w1, th);
+                cairo_fill(cr);
+            }
+
+            // Handle
+            int hx = tab_x + w1;
+            bool hover_handle = win->split_view_.dragging_handle;
+            cairo_set_source_rgb(cr, hover_handle ? 0.48 : 0.2, hover_handle ? 0.63 : 0.2, hover_handle ? 0.97 : 0.3);
+            cairo_rectangle(cr, hx, tbh, handle, th);
+            cairo_fill(cr);
+
+            // Second panel
+            if (win->split_surface_) {
+                cairo_set_source_surface(cr, win->split_surface_, hx + handle, tbh);
+                cairo_rectangle(cr, hx + handle, tbh, w2, th);
+                cairo_fill(cr);
+            }
+        } else {
+            int h1 = (int)(th * win->split_view_.ratio) - handle / 2;
+            int h2 = th - h1 - handle;
+
+            // First panel
+            if (win->tab_surface_) {
+                cairo_set_source_surface(cr, win->tab_surface_, tab_x, tbh);
+                cairo_rectangle(cr, tab_x, tbh, tw, h1);
+                cairo_fill(cr);
+            }
+
+            // Handle
+            int hy = tbh + h1;
+            bool hover_handle = win->split_view_.dragging_handle;
+            cairo_set_source_rgb(cr, hover_handle ? 0.48 : 0.2, hover_handle ? 0.63 : 0.2, hover_handle ? 0.97 : 0.3);
+            cairo_rectangle(cr, tab_x, hy, tw, handle);
+            cairo_fill(cr);
+
+            // Second panel
+            if (win->split_surface_) {
+                cairo_set_source_surface(cr, win->split_surface_, tab_x, hy + handle);
+                cairo_rectangle(cr, tab_x, hy + handle, tw, h2);
+                cairo_fill(cr);
+            }
+        }
     } else {
-        cairo_set_source_rgb(cr, 0.1, 0.1, 0.15);
-        cairo_rectangle(cr, kSidebarWidth, tbh, win->width_ - kSidebarWidth, win->height_ - tbh);
-        cairo_fill(cr);
+        // Normal single-tab view
+        if (win->tab_surface_) {
+            cairo_set_source_surface(cr, win->tab_surface_, tab_x, tbh);
+            cairo_rectangle(cr, tab_x, tbh, win->tab_buf_w_, win->tab_buf_h_);
+            cairo_fill(cr);
+        } else {
+            cairo_set_source_rgb(cr, 0.1, 0.1, 0.15);
+            cairo_rectangle(cr, tab_x, tbh, win->width_ - tab_x, win->height_ - tbh);
+            cairo_fill(cr);
+        }
     }
 
     // ─── Draw sidebar (below titlebar) ──────────────────
-    if (win->sidebar_surface_ && kSidebarWidth > 0) {
+    // Pinned: draw at x=0 with kSidebarWidth
+    // Unpinned overlay: draw at x=0 with sidebar_overlay_width_ on top of tab
+    int draw_sw = kSidebarWidth;
+    if (!win->sidebar_pinned_ && win->sidebar_overlay_width_ > 0) {
+        draw_sw = win->sidebar_overlay_width_;
+    }
+    if (win->sidebar_surface_ && draw_sw > 0) {
         cairo_set_source_surface(cr, win->sidebar_surface_, 0, tbh);
-        cairo_rectangle(cr, 0, tbh, kSidebarWidth, win->sidebar_buf_h_);
+        cairo_rectangle(cr, 0, tbh, draw_sw, win->sidebar_buf_h_);
         cairo_fill(cr);
     }
 
@@ -249,9 +382,35 @@ gboolean BrowserWindow::OnDraw(GtkWidget* widget, cairo_t* cr, gpointer data) {
 // ─── Input handling ────────────────────────────────────────
 
 CefRefPtr<CefBrowser> BrowserWindow::GetBrowserAtX(int x) {
+    // Check pinned sidebar
     if (x < kSidebarWidth && kSidebarWidth > 0 && sidebar_browser_) {
         return sidebar_browser_;
     }
+    // Check overlay sidebar (unpinned hover)
+    if (!sidebar_pinned_ && sidebar_overlay_width_ > 0 && x < sidebar_overlay_width_ && sidebar_browser_) {
+        return sidebar_browser_;
+    }
+
+    // Split view: determine which panel
+    if (split_view_.active && split_view_.second_tab_id >= 0) {
+        int tab_x = x - kSidebarWidth;
+        int tw = width_ - kSidebarWidth;
+        int handle = 4;
+        if (split_view_.horizontal) {
+            int w1 = (int)(tw * split_view_.ratio) - handle / 2;
+            if (tab_x >= w1 && tab_x < w1 + handle) {
+                // On the handle — return active tab but mark for drag
+                int active = tab_manager_.GetActiveTabId();
+                return active >= 0 ? tab_manager_.GetBrowser(active) : nullptr;
+            }
+            if (tab_x >= w1 + handle) {
+                return tab_manager_.GetBrowser(split_view_.second_tab_id);
+            }
+        } else {
+            // For vertical split, need Y — handled in OnButtonPress/OnMotionNotify
+        }
+    }
+
     int active = tab_manager_.GetActiveTabId();
     if (active >= 0) {
         return tab_manager_.GetBrowser(active);
@@ -262,7 +421,17 @@ CefRefPtr<CefBrowser> BrowserWindow::GetBrowserAtX(int x) {
 int BrowserWindow::AdjustX(int x, CefRefPtr<CefBrowser> browser) {
     // If it's a tab browser, subtract sidebar width
     if (sidebar_browser_ && browser->GetIdentifier() != sidebar_browser_->GetIdentifier()) {
-        return x - kSidebarWidth;
+        int adjusted = x - kSidebarWidth;
+        // Split view second panel: also subtract first panel + handle width
+        if (split_view_.active && split_view_.second_tab_id >= 0 && split_view_.horizontal) {
+            auto second = tab_manager_.GetBrowser(split_view_.second_tab_id);
+            if (second && browser->GetIdentifier() == second->GetIdentifier()) {
+                int tw = width_ - kSidebarWidth;
+                int w1 = (int)(tw * split_view_.ratio) - 2;
+                adjusted = x - kSidebarWidth - w1 - 4;
+            }
+        }
+        return adjusted;
     }
     return x;
 }
@@ -342,6 +511,27 @@ gboolean BrowserWindow::OnButtonPress(GtkWidget* widget, GdkEventButton* event, 
     int cy = y - kTitleBarHeight;
     if (cy < 0) return FALSE;
 
+    // Split view handle drag start
+    if (win->split_view_.active && win->split_view_.second_tab_id >= 0 && event->button == 1) {
+        int tw = win->width_ - kSidebarWidth;
+        int handle = 4;
+        int tab_x = x - kSidebarWidth;
+        if (win->split_view_.horizontal) {
+            int w1 = (int)(tw * win->split_view_.ratio) - handle / 2;
+            if (tab_x >= w1 - 2 && tab_x <= w1 + handle + 2) {
+                win->split_view_.dragging_handle = true;
+                return TRUE;
+            }
+        } else {
+            int th = win->height_ - kTitleBarHeight;
+            int h1 = (int)(th * win->split_view_.ratio) - handle / 2;
+            if (cy >= h1 - 2 && cy <= h1 + handle + 2) {
+                win->split_view_.dragging_handle = true;
+                return TRUE;
+            }
+        }
+    }
+
     auto browser = win->GetBrowserAtX(x);
     if (!browser) return FALSE;
 
@@ -361,7 +551,10 @@ gboolean BrowserWindow::OnButtonPress(GtkWidget* widget, GdkEventButton* event, 
     if (event->button == 2) btn = MBT_MIDDLE;
     else if (event->button == 3) btn = MBT_RIGHT;
 
-    browser->GetHost()->SendMouseClickEvent(cef_event, btn, false, event->type == GDK_2BUTTON_PRESS ? 2 : 1);
+    int click_count = 1;
+    if (event->type == GDK_2BUTTON_PRESS) click_count = 2;
+    else if (event->type == GDK_3BUTTON_PRESS) click_count = 3;
+    browser->GetHost()->SendMouseClickEvent(cef_event, btn, false, click_count);
     return TRUE;
 }
 
@@ -370,6 +563,13 @@ gboolean BrowserWindow::OnButtonRelease(GtkWidget* widget, GdkEventButton* event
 
     if (win->titlebar_dragging_) {
         win->titlebar_dragging_ = false;
+        return TRUE;
+    }
+
+    if (win->split_view_.dragging_handle) {
+        win->split_view_.dragging_handle = false;
+        win->ForceResize();
+        gtk_widget_queue_draw(win->drawing_area_);
         return TRUE;
     }
 
@@ -402,6 +602,25 @@ gboolean BrowserWindow::OnMotionNotify(GtkWidget* widget, GdkEventMotion* event,
         int dy = (int)event->y_root - win->drag_start_y_;
         gtk_window_move(GTK_WINDOW(win->main_window_),
                         win->win_start_x_ + dx, win->win_start_y_ + dy);
+        return TRUE;
+    }
+
+    // ─── Split view handle drag ──────────────────────
+    if (win->split_view_.dragging_handle) {
+        if (win->split_view_.horizontal) {
+            int tw = win->width_ - kSidebarWidth;
+            float new_ratio = (float)(x - kSidebarWidth) / tw;
+            if (new_ratio < 0.15f) new_ratio = 0.15f;
+            if (new_ratio > 0.85f) new_ratio = 0.85f;
+            win->split_view_.ratio = new_ratio;
+        } else {
+            int th = win->height_ - kTitleBarHeight;
+            float new_ratio = (float)(y - kTitleBarHeight) / th;
+            if (new_ratio < 0.15f) new_ratio = 0.15f;
+            if (new_ratio > 0.85f) new_ratio = 0.85f;
+            win->split_view_.ratio = new_ratio;
+        }
+        gtk_widget_queue_draw(win->drawing_area_);
         return TRUE;
     }
 
@@ -452,6 +671,7 @@ gboolean BrowserWindow::OnMotionNotify(GtkWidget* widget, GdkEventMotion* event,
     // ─── Auto-hide sidebar detection ─────────────────
     int cy = y - kTitleBarHeight;
     if (!win->sidebar_pinned_) {
+        int sidebar_w = win->sidebar_overlay_width_ > 0 ? win->sidebar_overlay_width_ : kSidebarWidth;
         if (x <= 4 && !win->sidebar_hovered_) {
             win->sidebar_hovered_ = true;
             if (win->sidebar_hide_timer_) {
@@ -459,7 +679,7 @@ gboolean BrowserWindow::OnMotionNotify(GtkWidget* widget, GdkEventMotion* event,
                 win->sidebar_hide_timer_ = 0;
             }
             win->ShowSidebarAnimated();
-        } else if (x > kSidebarWidth + 20 && win->sidebar_hovered_ && kSidebarWidth > 0) {
+        } else if (win->sidebar_hovered_ && sidebar_w > 0 && x > sidebar_w + 20) {
             if (!win->sidebar_hide_timer_) {
                 win->sidebar_hide_timer_ = g_timeout_add(400, [](gpointer data) -> gboolean {
                     auto* w = static_cast<BrowserWindow*>(data);
@@ -471,7 +691,7 @@ gboolean BrowserWindow::OnMotionNotify(GtkWidget* widget, GdkEventMotion* event,
                     return G_SOURCE_REMOVE;
                 }, win);
             }
-        } else if (x <= kSidebarWidth && win->sidebar_hovered_) {
+        } else if (x <= sidebar_w && win->sidebar_hovered_) {
             if (win->sidebar_hide_timer_) {
                 g_source_remove(win->sidebar_hide_timer_);
                 win->sidebar_hide_timer_ = 0;
@@ -683,13 +903,17 @@ void BrowserWindow::ForceResize() {
     if (sidebar_browser_) {
         sidebar_browser_->GetHost()->WasResized();
     }
-    // Resize all tab browsers (width depends on sidebar)
-    auto ids = tab_manager_.GetTabIds();
-    for (int id : ids) {
-        auto browser = tab_manager_.GetBrowser(id);
-        if (browser) {
-            browser->GetHost()->WasResized();
-        }
+    // Only the browsers that are actually on screen need a new size. A hidden
+    // tab is resized again in ShowTab() when it comes back.
+    const int active = tab_manager_.GetActiveTabId();
+    if (active >= 0) {
+        auto browser = tab_manager_.GetBrowser(active);
+        if (browser) browser->GetHost()->WasResized();
+    }
+    if (split_view_.active && split_view_.second_tab_id >= 0 &&
+        split_view_.second_tab_id != active) {
+        auto second = tab_manager_.GetBrowser(split_view_.second_tab_id);
+        if (second) second->GetHost()->WasResized();
     }
 }
 
@@ -760,7 +984,13 @@ BrowserWindow* BrowserWindow::Create(std::shared_ptr<FilterRuleSet> filter_rules
     CefWindowInfo info;
     info.SetAsWindowless(parent_xwin);
     CefBrowserSettings settings;
-    settings.windowless_frame_rate = 60;
+    // Use monitor refresh rate
+    {
+        GdkScreen* screen = gtk_widget_get_screen(win->main_window_);
+        GdkMonitor* monitor = gdk_display_get_primary_monitor(gdk_screen_get_display(screen));
+        int rate = monitor ? gdk_monitor_get_refresh_rate(monitor) / 1000 : 60;
+        settings.windowless_frame_rate = rate > 0 ? rate : 60;
+    }
     settings.background_color = CefColorSetARGB(255, 30, 30, 30);
     CefBrowserHost::CreateBrowser(info, win->GetClient(),
         "orb://chrome/index.html", settings, nullptr, nullptr);
@@ -856,7 +1086,12 @@ void BrowserWindow::CreateTabBrowser(int tab_id, const std::string& url, bool in
     CefWindowInfo info;
     info.SetAsWindowless(parent_xwin);
     CefBrowserSettings settings;
-    settings.windowless_frame_rate = 60;
+    {
+        GdkScreen* screen = gtk_widget_get_screen(main_window_);
+        GdkMonitor* monitor = gdk_display_get_primary_monitor(gdk_screen_get_display(screen));
+        int rate = monitor ? gdk_monitor_get_refresh_rate(monitor) / 1000 : 60;
+        settings.windowless_frame_rate = rate > 0 ? rate : 60;
+    }
     settings.background_color = CefColorSetARGB(255, 255, 255, 255);
 
     CefRefPtr<CefRequestContext> request_context = nullptr;
@@ -883,9 +1118,18 @@ void BrowserWindow::ShowTab(int tab_id) {
         }
     }
 
+    // Hide every other tab: an OSR browser that is never told it is hidden
+    // keeps producing frames we immediately throw away.
+    for (int id : tab_manager_.GetTabIds()) {
+        if (id == tab_id || id == split_view_.second_tab_id) continue;
+        auto other = tab_manager_.GetBrowser(id);
+        if (other) other->GetHost()->WasHidden(true);
+    }
+
     // Tell the new tab's browser to repaint
     auto browser = tab_manager_.GetBrowser(tab_id);
     if (browser) {
+        browser->GetHost()->WasHidden(false);
         browser->GetHost()->WasResized();
         browser->GetHost()->Invalidate(PET_VIEW);
     }
@@ -893,6 +1137,12 @@ void BrowserWindow::ShowTab(int tab_id) {
         gtk_widget_queue_draw(drawing_area_);
     }
 }
+
+struct SidebarAnimData {
+    BrowserWindow* win;
+    int target_width;
+    bool is_show;  // true = showing, false = hiding
+};
 
 void BrowserWindow::ToggleSidebar() {
     CEF_REQUIRE_UI_THREAD();
@@ -905,16 +1155,33 @@ void BrowserWindow::SetSidebarPinned(bool pinned) {
     sidebar_pinned_ = pinned;
 
     if (pinned) {
-        // Pin: show sidebar, cancel timers
+        // Pin: show sidebar, cancel timers, reset overlay
         sidebar_hovered_ = false;
+        sidebar_overlay_width_ = 0;
         if (sidebar_hide_timer_) {
             g_source_remove(sidebar_hide_timer_);
             sidebar_hide_timer_ = 0;
         }
         ShowSidebarAnimated();
     } else {
-        // Unpin: hide sidebar
-        HideSidebarAnimated();
+        // Unpin: collapse kSidebarWidth directly and resize
+        sidebar_overlay_width_ = 0;
+        auto* anim = new SidebarAnimData{this, 0, false};
+        g_timeout_add(12, [](gpointer data) -> gboolean {
+            auto* a = static_cast<SidebarAnimData*>(data);
+            auto* w = a->win;
+            if (w->sidebar_pinned_) { delete a; return G_SOURCE_REMOVE; }
+            int remaining = kSidebarWidth;
+            int step = remaining / 3;
+            if (step < 12) step = 12;
+            if (step > remaining) step = remaining;
+            kSidebarWidth -= step;
+            if (kSidebarWidth <= 0) kSidebarWidth = 0;
+            w->ForceResize();
+            if (w->drawing_area_) gtk_widget_queue_draw(w->drawing_area_);
+            if (kSidebarWidth <= 0) { w->sidebar_visible_ = false; delete a; return G_SOURCE_REMOVE; }
+            return G_SOURCE_CONTINUE;
+        }, anim);
     }
 
     // Notify sidebar JS about pin state
@@ -925,76 +1192,89 @@ void BrowserWindow::SetSidebarPinned(bool pinned) {
     }
 }
 
-struct SidebarAnimData {
-    BrowserWindow* win;
-    int target_width;
-    bool is_show;  // true = showing, false = hiding
-};
-
 void BrowserWindow::ShowSidebarAnimated() {
-    if (kSidebarWidth >= kDefaultSidebarWidth) return;
-
-    auto* anim = new SidebarAnimData{this, kDefaultSidebarWidth, true};
-    g_timeout_add(12, [](gpointer data) -> gboolean {
-        auto* a = static_cast<SidebarAnimData*>(data);
-        auto* w = a->win;
-
-        if (!w->sidebar_pinned_ && !w->sidebar_hovered_) {
-            delete a;
-            return G_SOURCE_REMOVE;
-        }
-
-        int remaining = a->target_width - kSidebarWidth;
-        int step = remaining / 3;
-        if (step < 12) step = 12;
-        if (step > remaining) step = remaining;
-
-        kSidebarWidth += step;
-        if (kSidebarWidth >= a->target_width) kSidebarWidth = a->target_width;
-
-        w->sidebar_visible_ = true;
-        w->ForceResize();
-        if (w->drawing_area_) gtk_widget_queue_draw(w->drawing_area_);
-
-        if (kSidebarWidth >= a->target_width) {
-            delete a;
-            return G_SOURCE_REMOVE;
-        }
-        return G_SOURCE_CONTINUE;
-    }, anim);
+    if (sidebar_pinned_) {
+        // Pinned: animate kSidebarWidth with ForceResize
+        if (kSidebarWidth >= kDefaultSidebarWidth) return;
+        auto* anim = new SidebarAnimData{this, kDefaultSidebarWidth, true};
+        g_timeout_add(12, [](gpointer data) -> gboolean {
+            auto* a = static_cast<SidebarAnimData*>(data);
+            auto* w = a->win;
+            if (!w->sidebar_pinned_) { delete a; return G_SOURCE_REMOVE; }
+            int remaining = a->target_width - kSidebarWidth;
+            int step = remaining / 3;
+            if (step < 12) step = 12;
+            if (step > remaining) step = remaining;
+            kSidebarWidth += step;
+            if (kSidebarWidth >= a->target_width) kSidebarWidth = a->target_width;
+            w->sidebar_visible_ = true;
+            w->ForceResize();
+            if (w->drawing_area_) gtk_widget_queue_draw(w->drawing_area_);
+            if (kSidebarWidth >= a->target_width) { delete a; return G_SOURCE_REMOVE; }
+            return G_SOURCE_CONTINUE;
+        }, anim);
+    } else {
+        // Unpinned hover: animate overlay width only (no resize)
+        if (sidebar_overlay_width_ >= kDefaultSidebarWidth) return;
+        auto* anim = new SidebarAnimData{this, kDefaultSidebarWidth, true};
+        g_timeout_add(12, [](gpointer data) -> gboolean {
+            auto* a = static_cast<SidebarAnimData*>(data);
+            auto* w = a->win;
+            if (!w->sidebar_hovered_) { delete a; return G_SOURCE_REMOVE; }
+            int remaining = a->target_width - w->sidebar_overlay_width_;
+            int step = remaining / 3;
+            if (step < 12) step = 12;
+            if (step > remaining) step = remaining;
+            w->sidebar_overlay_width_ += step;
+            if (w->sidebar_overlay_width_ >= a->target_width) w->sidebar_overlay_width_ = a->target_width;
+            w->sidebar_visible_ = true;
+            // No ForceResize — just redraw overlay
+            if (w->drawing_area_) gtk_widget_queue_draw(w->drawing_area_);
+            if (w->sidebar_overlay_width_ >= a->target_width) { delete a; return G_SOURCE_REMOVE; }
+            return G_SOURCE_CONTINUE;
+        }, anim);
+    }
 }
 
 void BrowserWindow::HideSidebarAnimated() {
-    if (kSidebarWidth <= 0) return;
-
-    auto* anim = new SidebarAnimData{this, 0, false};
-    g_timeout_add(12, [](gpointer data) -> gboolean {
-        auto* a = static_cast<SidebarAnimData*>(data);
-        auto* w = a->win;
-
-        if (w->sidebar_pinned_ || w->sidebar_hovered_) {
-            delete a;
-            return G_SOURCE_REMOVE;
-        }
-
-        int remaining = kSidebarWidth;
-        int step = remaining / 3;
-        if (step < 12) step = 12;
-        if (step > remaining) step = remaining;
-
-        kSidebarWidth -= step;
-        if (kSidebarWidth <= 0) kSidebarWidth = 0;
-
-        w->ForceResize();
-        if (w->drawing_area_) gtk_widget_queue_draw(w->drawing_area_);
-
-        if (kSidebarWidth <= 0) {
-            w->sidebar_visible_ = false;
-            delete a;
-            return G_SOURCE_REMOVE;
-        }
-        return G_SOURCE_CONTINUE;
-    }, anim);
+    if (sidebar_pinned_) {
+        // Pinned hide: animate kSidebarWidth
+        if (kSidebarWidth <= 0) return;
+        auto* anim = new SidebarAnimData{this, 0, false};
+        g_timeout_add(12, [](gpointer data) -> gboolean {
+            auto* a = static_cast<SidebarAnimData*>(data);
+            auto* w = a->win;
+            if (w->sidebar_pinned_ || w->sidebar_hovered_) { delete a; return G_SOURCE_REMOVE; }
+            int remaining = kSidebarWidth;
+            int step = remaining / 3;
+            if (step < 12) step = 12;
+            if (step > remaining) step = remaining;
+            kSidebarWidth -= step;
+            if (kSidebarWidth <= 0) kSidebarWidth = 0;
+            w->ForceResize();
+            if (w->drawing_area_) gtk_widget_queue_draw(w->drawing_area_);
+            if (kSidebarWidth <= 0) { w->sidebar_visible_ = false; delete a; return G_SOURCE_REMOVE; }
+            return G_SOURCE_CONTINUE;
+        }, anim);
+    } else {
+        // Unpinned hover hide: animate overlay width (no resize)
+        if (sidebar_overlay_width_ <= 0) return;
+        auto* anim = new SidebarAnimData{this, 0, false};
+        g_timeout_add(12, [](gpointer data) -> gboolean {
+            auto* a = static_cast<SidebarAnimData*>(data);
+            auto* w = a->win;
+            if (w->sidebar_pinned_ || w->sidebar_hovered_) { delete a; return G_SOURCE_REMOVE; }
+            int remaining = w->sidebar_overlay_width_;
+            int step = remaining / 3;
+            if (step < 12) step = 12;
+            if (step > remaining) step = remaining;
+            w->sidebar_overlay_width_ -= step;
+            if (w->sidebar_overlay_width_ <= 0) w->sidebar_overlay_width_ = 0;
+            if (w->drawing_area_) gtk_widget_queue_draw(w->drawing_area_);
+            if (w->sidebar_overlay_width_ <= 0) { w->sidebar_visible_ = false; delete a; return G_SOURCE_REMOVE; }
+            return G_SOURCE_CONTINUE;
+        }, anim);
+    }
 }
 
 void BrowserWindow::OnBrowserCreated(CefRefPtr<CefBrowser> browser) {
@@ -1019,6 +1299,25 @@ void BrowserWindow::OnBrowserCreated(CefRefPtr<CefBrowser> browser) {
     browser->GetHost()->WasResized();
     browser->GetHost()->SetFocus(true);
     browser->GetHost()->Invalidate(PET_VIEW);
+}
+
+void BrowserWindow::OnBrowserClosed(CefRefPtr<CefBrowser> browser) {
+    if (!browser) return;
+    const int bid = browser->GetIdentifier();
+
+    if (focused_browser_ && focused_browser_->GetIdentifier() == bid) {
+        focused_browser_ = nullptr;
+    }
+    if (sidebar_browser_ && sidebar_browser_->GetIdentifier() == bid) {
+        sidebar_browser_ = nullptr;
+    }
+    // The closing tab may be the split partner; drop the panel with it.
+    if (split_view_.active && split_view_.second_tab_id >= 0) {
+        auto second = tab_manager_.GetBrowser(split_view_.second_tab_id);
+        if (second && second->GetIdentifier() == bid) {
+            CloseSplitView();
+        }
+    }
 }
 
 void BrowserWindow::Close() {
@@ -1070,4 +1369,67 @@ void BrowserWindow::Close() {
     std::lock_guard<std::mutex> lock(paint_mutex_);
     if (sidebar_surface_) { cairo_surface_destroy(sidebar_surface_); sidebar_surface_ = nullptr; }
     if (tab_surface_) { cairo_surface_destroy(tab_surface_); tab_surface_ = nullptr; }
+    if (split_surface_) { cairo_surface_destroy(split_surface_); split_surface_ = nullptr; }
+}
+
+void BrowserWindow::SetSplitView(int second_tab_id, bool horizontal) {
+    if (second_tab_id < 0) return;
+    auto browser = tab_manager_.GetBrowser(second_tab_id);
+    if (!browser) return;
+
+    split_view_.active = true;
+    split_view_.horizontal = horizontal;
+    split_view_.second_tab_id = second_tab_id;
+    split_view_.ratio = 0.5f;
+    split_view_.dragging_handle = false;
+
+    // The partner panel is on screen now.
+    browser->GetHost()->WasHidden(false);
+
+    // Notify both browsers to resize
+    ForceResize();
+
+    // Tell sidebar about split state
+    if (client_) {
+        std::string js = "if(typeof orb!=='undefined') orb.onSplitViewChanged(true, " +
+            std::to_string(second_tab_id) + ");";
+        auto sidebar = sidebar_browser_;
+        if (sidebar && sidebar->GetMainFrame()) {
+            sidebar->GetMainFrame()->ExecuteJavaScript(js, "orb://internal", 0);
+        }
+    }
+}
+
+void BrowserWindow::CloseSplitView() {
+    if (!split_view_.active) return;
+
+    const int second_tab_id = split_view_.second_tab_id;
+    split_view_.active = false;
+    split_view_.second_tab_id = -1;
+    split_view_.dragging_handle = false;
+
+    // The partner is off screen again unless it is the active tab.
+    if (second_tab_id >= 0 && second_tab_id != tab_manager_.GetActiveTabId()) {
+        auto second = tab_manager_.GetBrowser(second_tab_id);
+        if (second) second->GetHost()->WasHidden(true);
+    }
+
+    // Clean up split surface
+    {
+        std::lock_guard<std::mutex> lock(paint_mutex_);
+        if (split_surface_) {
+            cairo_surface_destroy(split_surface_);
+            split_surface_ = nullptr;
+        }
+        split_buf_w_ = split_buf_h_ = 0;
+    }
+
+    ForceResize();
+
+    // Notify sidebar
+    if (sidebar_browser_ && sidebar_browser_->GetMainFrame()) {
+        sidebar_browser_->GetMainFrame()->ExecuteJavaScript(
+            "if(typeof orb!=='undefined') orb.onSplitViewChanged(false, -1);",
+            "orb://internal", 0);
+    }
 }

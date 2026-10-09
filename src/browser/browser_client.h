@@ -14,6 +14,7 @@
 #include "include/cef_request_handler.h"
 #include "include/wrapper/cef_message_router.h"
 
+#include <cstdint>
 #include <memory>
 
 class BrowserWindow;
@@ -81,6 +82,13 @@ public:
                          const CefString& url) override;
     void OnTitleChange(CefRefPtr<CefBrowser> browser,
                        const CefString& title) override;
+    bool OnConsoleMessage(CefRefPtr<CefBrowser> browser,
+                          cef_log_severity_t level,
+                          const CefString& message,
+                          const CefString& source,
+                          int line) override;
+    void OnFullscreenModeChange(CefRefPtr<CefBrowser> browser,
+                                bool fullscreen) override;
 
     // CefRequestHandler
     CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
@@ -111,6 +119,10 @@ public:
                  const RectList& dirtyRects,
                  const void* buffer,
                  int width, int height) override;
+    bool OnCursorChange(CefRefPtr<CefBrowser> browser,
+                        CefCursorHandle cursor,
+                        cef_cursor_type_t type,
+                        const CefCursorInfo& custom_cursor_info) override;
 
     // CefContextMenuHandler
     void OnBeforeContextMenu(CefRefPtr<CefBrowser> browser,
@@ -150,8 +162,15 @@ public:
     void SetChromeBrowser(CefRefPtr<CefBrowser> browser) { chrome_browser_ = browser; }
     CefRefPtr<CefBrowser> GetChromeBrowser() { return chrome_browser_; }
 
+    // One-shot permission for untrusted web content to hand its own selection
+    // back through cefQuery (Ctrl+C / Ctrl+X). Armed by the browser process
+    // when it sees the shortcut, consumed by the first matching query.
+    void ArmClipboardToken(int browser_id);
+    bool ConsumeClipboardToken(int browser_id);
+
 private:
     void NotifySidebar(const std::string& js);
+    void ShowFloatingUrlBar();
 
     TabManager* tab_manager_;
     BrowserWindow* window_;
@@ -159,6 +178,8 @@ private:
     CefRefPtr<RequestFilter> request_filter_;
     CefRefPtr<CefBrowser> chrome_browser_;
     int browser_count_ = 0;
+    int clipboard_token_browser_ = -1;
+    int64_t clipboard_token_deadline_ms_ = 0;
 
     IMPLEMENT_REFCOUNTING(BrowserClient);
     DISALLOW_COPY_AND_ASSIGN(BrowserClient);

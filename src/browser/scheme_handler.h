@@ -49,6 +49,7 @@ private:
     std::string data_;
     size_t offset_ = 0;
     std::string mime_type_;
+    int status_ = 200;
     bool inline_ = false;
 
     static std::string GetMimeType(const std::string& path);

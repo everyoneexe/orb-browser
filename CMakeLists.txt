@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(zen-browser LANGUAGES C CXX)
+project(orb-browser LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,7 +25,7 @@ find_package(CEF REQUIRED)
 add_subdirectory(${CEF_ROOT}/libcef_dll libcef_dll_wrapper)
 
 # Source files
-set(ZEN_SOURCES
+set(ORB_SOURCES
     src/main.cc
     src/browser/browser_app.cc
     src/browser/browser_client.cc
@@ -42,16 +42,16 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
 
 # Main executable
-add_executable(zen-browser ${ZEN_SOURCES})
+add_executable(orb-browser ${ORB_SOURCES})
 
-target_include_directories(zen-browser PRIVATE
+target_include_directories(orb-browser PRIVATE
     ${CEF_ROOT}
     ${CMAKE_SOURCE_DIR}/src
     ${GTK3_INCLUDE_DIRS}
 )
 
 # Link CEF + GTK
-target_link_libraries(zen-browser
+target_link_libraries(orb-browser
     libcef_dll_wrapper
     "${CEF_BINARY_DIR_LOCAL}/libcef.so"
     pthread
@@ -59,7 +59,7 @@ target_link_libraries(zen-browser
 )
 
 # CEF helper: set RPATH so libcef.so is found at runtime
-set_target_properties(zen-browser PROPERTIES
+set_target_properties(orb-browser PROPERTIES
     BUILD_RPATH "${CMAKE_BINARY_DIR}"
     INSTALL_RPATH "$ORIGIN"
 )

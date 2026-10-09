@@ -68,7 +68,7 @@ make -j$(nproc)
 3. Run:
 
 ```
-cd build && ./zen-browser
+cd build && ./orb-browser
 ```
 
 ## Benchmarks
@@ -80,7 +80,7 @@ Tested on Linux x86_64 with NVIDIA GeForce RTX 4070 Laptop GPU. Same machine, sa
 | Speedometer 3.0 | 20.4 | 22.0 | JS/DOM performance |
 | MotionMark 1.2 | 720.98 | 707.97 | Graphics/rendering |
 
-Orb Browser uses CEF with off-screen rendering (OSR), single-process mode, and a minimal UI layer. The simplified rendering pipeline and lack of multi-process IPC overhead result in competitive graphics performance despite the OSR compositing cost.
+Orb Browser uses CEF with off-screen rendering (OSR): both the sidebar chrome and every tab are rendered into CPU buffers and composited with Cairo. Rendering still runs in Chromium's normal multi-process model (one browser process plus renderer/GPU/utility processes); the GPU process is forced in-process. The OSR readback is a real cost, so these numbers say the pipeline is competitive, not that it is cheaper than a windowed browser.
 
 ## Project Structure
 
@@ -130,9 +130,21 @@ resources/
 - [x] Keyboard shortcuts (Ctrl+T/W/L/Tab, F11, F12)
 - [x] Configurable search engine (Google, DuckDuckGo, Bing, Brave)
 - [x] Configurable download directory
-- [x] Wayland support
+- [x] Runs under Wayland through XWayland (`GDK_BACKEND=x11` is forced in `main.cc`)
 
 ### Planned
+
+Consequences of the off-screen rendering design that are not implemented yet:
+
+- [ ] IME / compose-key input (`CefRenderHandler::OnImeComposition` is not wired up, so CJK and dead-key input do not work)
+- [ ] HiDPI (no `GetScreenInfo`/device scale factor: pages render at 1x)
+- [ ] Drag and drop into and out of pages (`StartDragging`/`UpdateDragCursor`)
+- [ ] Tooltips (`OnTooltip`)
+- [ ] Accessibility tree
+- [ ] Native Wayland (currently XWayland only)
+- [ ] GPU-to-GPU compositing (`OnAcceleratedPaint`; today every frame goes through a CPU readback)
+
+Other planned work:
 
 - [ ] Windows support
 - [ ] Extension support

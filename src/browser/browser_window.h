@@ -31,6 +31,7 @@ public:
     TabManager* GetTabManager() { return &tab_manager_; }
     CefRefPtr<BrowserClient> GetClient();
     void OnBrowserCreated(CefRefPtr<CefBrowser> browser);
+    void OnBrowserClosed(CefRefPtr<CefBrowser> browser);
     GtkWidget* GetMainWindow() { return main_window_; }
 
     // OSR interface — called from BrowserClient's CefRenderHandler
@@ -39,6 +40,7 @@ public:
                     const std::vector<CefRect>& dirtyRects,
                     const void* buffer,
                     int width, int height);
+    void SetCursor(cef_cursor_type_t type);
 
     static const int kDefaultSidebarWidth = 280;
     static const int kTitleBarHeight = 32;
@@ -47,6 +49,7 @@ public:
     bool sidebar_pinned_ = true;
     bool sidebar_hovered_ = false;
     guint sidebar_hide_timer_ = 0;
+    int sidebar_overlay_width_ = 0;  // Overlay width when unpinned hover
     int width_ = 1400;
     int height_ = 900;
 
@@ -103,4 +106,23 @@ private:
 
     // Track which browser has keyboard focus
     CefRefPtr<CefBrowser> focused_browser_;
+
+    // Split view
+    struct SplitView {
+        bool active = false;
+        bool horizontal = true;  // true=side-by-side, false=top-bottom
+        int second_tab_id = -1;
+        float ratio = 0.5f;     // 0.0-1.0 split ratio
+        bool dragging_handle = false;
+    };
+    SplitView split_view_;
+    cairo_surface_t* split_surface_ = nullptr;
+    int split_buf_w_ = 0, split_buf_h_ = 0;
+
+public:
+    // Split view interface
+    void SetSplitView(int second_tab_id, bool horizontal);
+    void CloseSplitView();
+    bool IsSplitViewActive() const { return split_view_.active; }
+    int GetSplitSecondTabId() const { return split_view_.second_tab_id; }
 };

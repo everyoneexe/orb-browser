@@ -1,8 +1,169 @@
 #include "blocker/filter_rules.h"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iostream>
+
+namespace {
+
+// Shorter tokens are too common to be selective.
+constexpr size_t kMinTokenLength = 4;
+
+inline bool IsTokenChar(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+
+// EasyList's '^' separator class: everything except letters, digits and
+// '-', '.', '%', '_'.
+inline bool IsSeparator(unsigned char c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+        return false;
+    return !(c == '-' || c == '.' || c == '%' || c == '_');
+}
+
+std::string ToLower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+// Host of a URL, plus the offset just past it.
+std::string_view HostOf(std::string_view url, size_t* host_end) {
+    auto scheme = url.find("://");
+    size_t start = (scheme == std::string_view::npos) ? 0 : scheme + 3;
+    auto end = url.find_first_of(":/?#", start);
+    if (end == std::string_view::npos) end = url.size();
+    if (host_end) *host_end = end;
+    return url.substr(start, end - start);
+}
+
+// host == suffix, or host is a subdomain of suffix.
+bool HostMatches(std::string_view host, std::string_view suffix) {
+    if (host == suffix) return true;
+    if (host.size() > suffix.size()) {
+        const size_t pos = host.size() - suffix.size();
+        return host[pos - 1] == '.' && host.compare(pos, suffix.size(), suffix) == 0;
+    }
+    return false;
+}
+
+bool IsThirdParty(std::string_view host, std::string_view page_domain) {
+    // An unknown document origin (the top-level navigation itself) must not be
+    // treated as third-party, or $third-party rules would cancel the page.
+    if (page_domain.empty()) return false;
+    return !HostMatches(host, page_domain) && !HostMatches(page_domain, host);
+}
+
+// Element hiding and friends: ##, #@#, #?#, #$#, #%#. These are not network
+// rules and must never reach the URL matcher.
+bool IsCosmeticRule(const std::string& line) {
+    for (auto h = line.find('#'); h != std::string::npos; h = line.find('#', h + 1)) {
+        if (h + 1 >= line.size()) break;
+        const char a = line[h + 1];
+        if (a == '#') return true;
+        if (h + 2 < line.size() && line[h + 2] == '#' &&
+            (a == '@' || a == '?' || a == '$' || a == '%'))
+            return true;
+    }
+    return false;
+}
+
+void CollectTokens(std::string_view s, std::vector<std::string_view>& out) {
+    size_t i = 0;
+    while (i < s.size()) {
+        if (!IsTokenChar(static_cast<unsigned char>(s[i]))) {
+            i++;
+            continue;
+        }
+        size_t j = i + 1;
+        while (j < s.size() && IsTokenChar(static_cast<unsigned char>(s[j]))) j++;
+        if (j - i >= kMinTokenLength) out.push_back(s.substr(i, j - i));
+        i = j;
+    }
+}
+
+// Longest alphanumeric run in the pattern that is bounded on both sides. Only
+// such a run is guaranteed to appear as a whole token in every URL the pattern
+// matches, which is what makes the token index lossless (no false negatives).
+std::string PickIndexToken(const std::string& pattern, bool anchor_start, bool anchor_end) {
+    std::string best;
+    size_t i = 0;
+    while (i < pattern.size()) {
+        if (!IsTokenChar(static_cast<unsigned char>(pattern[i]))) {
+            i++;
+            continue;
+        }
+        size_t j = i + 1;
+        while (j < pattern.size() && IsTokenChar(static_cast<unsigned char>(pattern[j]))) j++;
+
+        const bool left_bounded  = (i == 0) ? anchor_start : (pattern[i - 1] != '*');
+        const bool right_bounded = (j == pattern.size()) ? anchor_end : (pattern[j] != '*');
+        if (left_bounded && right_bounded && (j - i) >= kMinTokenLength &&
+            (j - i) > best.size()) {
+            best.assign(pattern, i, j - i);
+        }
+        i = j;
+    }
+    return best;
+}
+
+// Sequential matcher honouring '*' (any run), '^' (exactly one separator or
+// end of URL) and the start/end anchors. `start` is where matching may begin,
+// which for ||host rules is the offset just past the host.
+bool MatchPattern(std::string_view url, const FilterRule& rule, size_t start) {
+    const std::string& pat = rule.pattern;
+    if (pat.empty()) return true;
+    if (start > url.size()) return false;
+
+    size_t pos = rule.anchor_start ? 0 : start;
+    bool floating = !rule.anchor_start;
+    size_t i = 0;
+
+    while (i < pat.size()) {
+        const char c = pat[i];
+        if (c == '*') {
+            floating = true;
+            i++;
+            continue;
+        }
+        if (c == '^') {
+            if (floating) {
+                size_t k = pos;
+                while (k < url.size() && !IsSeparator(static_cast<unsigned char>(url[k]))) k++;
+                pos = (k >= url.size()) ? url.size() : k + 1;
+            } else if (pos < url.size()) {
+                if (!IsSeparator(static_cast<unsigned char>(url[pos]))) return false;
+                pos++;
+            }
+            // End of URL satisfies a trailing separator.
+            floating = false;
+            i++;
+            continue;
+        }
+
+        size_t j = i;
+        while (j < pat.size() && pat[j] != '*' && pat[j] != '^') j++;
+        const std::string_view part(pat.data() + i, j - i);
+        if (floating) {
+            const size_t found = url.find(part, pos);
+            if (found == std::string_view::npos) return false;
+            pos = found + part.size();
+            floating = false;
+        } else {
+            if (pos + part.size() > url.size()) return false;
+            if (url.compare(pos, part.size(), part) != 0) return false;
+            pos += part.size();
+        }
+        i = j;
+    }
+
+    if (rule.anchor_end && pos != url.size()) return false;
+    return true;
+}
+
+}  // namespace
 
 FilterRuleSet::FilterRuleSet() {}
 FilterRuleSet::~FilterRuleSet() {}
@@ -14,27 +175,24 @@ void FilterRuleSet::Load(const std::string& path) {
         return;
     }
 
+    const size_t before = total_rules_;
     std::string line;
-    size_t count = 0;
     while (std::getline(file, line)) {
-        // Trim whitespace
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                 line.back() == ' ' || line.back() == '\t'))
             line.pop_back();
+        size_t lead = 0;
+        while (lead < line.size() && (line[lead] == ' ' || line[lead] == '\t')) lead++;
+        if (lead) line.erase(0, lead);
+
         if (line.empty()) continue;
-
-        // Skip comments and headers
         if (line[0] == '!' || line[0] == '[') continue;
-
-        // Skip element hiding rules (contain ## or #@#)
-        if (line.find("##") != std::string::npos || line.find("#@#") != std::string::npos)
-            continue;
+        if (IsCosmeticRule(line)) continue;
 
         ParseLine(line);
-        count++;
     }
 
-    total_rules_ += count;
-    std::cerr << "[Blocker] Loaded " << count << " rules from " << path
+    std::cerr << "[Blocker] Loaded " << (total_rules_ - before) << " rules from " << path
               << " (total: " << total_rules_ << ")" << std::endl;
 }
 
@@ -42,244 +200,254 @@ void FilterRuleSet::ParseLine(const std::string& line) {
     auto rule = std::make_unique<FilterRule>();
     std::string input = line;
 
-    // Check for exception
-    if (input.substr(0, 2) == "@@") {
+    if (input.rfind("@@", 0) == 0) {
         rule->is_exception = true;
-        input = input.substr(2);
+        input.erase(0, 2);
     }
 
-    // Check for options ($)
-    auto dollar = input.rfind('$');
+    bool document_exception = false;
+    const auto dollar = input.rfind('$');
     if (dollar != std::string::npos) {
-        std::string options = input.substr(dollar + 1);
-        input = input.substr(0, dollar);
-        ParseOptions(options, *rule);
+        if (!ParseOptions(input.substr(dollar + 1), *rule, document_exception))
+            return;  // option we do not implement: dropping beats over-applying
+        input.erase(dollar);
     }
 
-    // Check for domain anchor (||)
-    if (input.substr(0, 2) == "||") {
-        input = input.substr(2);
-        // Extract domain part (up to first / or ^)
-        auto sep = input.find_first_of("/^*");
-        if (sep != std::string::npos) {
-            rule->domain = input.substr(0, sep);
-            rule->pattern = input.substr(sep);
+    // Regex rules are not supported; treating them as substrings never matches.
+    if (input.size() > 1 && input.front() == '/' && input.back() == '/') return;
+
+    if (document_exception) {
+        std::string host = input;
+        if (host.rfind("||", 0) == 0) host.erase(0, 2);
+        const auto sep = host.find_first_of("/^*|");
+        if (sep != std::string::npos) host.erase(sep);
+        if (!host.empty()) document_allowlist_.insert(ToLower(host));
+        return;
+    }
+
+    if (input.rfind("||", 0) == 0) {
+        input.erase(0, 2);
+        const auto sep = input.find_first_of("/^*");
+        if (sep == std::string::npos) {
+            rule->domain = ToLower(input);
         } else {
-            rule->domain = input;
-            rule->pattern = "";
+            rule->domain = ToLower(input.substr(0, sep));
+            rule->pattern = ToLower(input.substr(sep));
+            // The host boundary is already guaranteed by the domain index.
+            if (!rule->pattern.empty() && rule->pattern[0] == '^')
+                rule->pattern.erase(0, 1);
         }
     } else {
-        // Strip leading | (start anchor)
-        if (!input.empty() && input[0] == '|') input = input.substr(1);
-        // Strip trailing | (end anchor)
-        if (!input.empty() && input.back() == '|') input.pop_back();
-        rule->pattern = input;
+        if (!input.empty() && input.front() == '|') {
+            rule->anchor_start = true;
+            input.erase(0, 1);
+        }
+        if (!input.empty() && input.back() == '|') {
+            rule->anchor_end = true;
+            input.pop_back();
+        }
+        rule->pattern = ToLower(input);
     }
 
-    // Store rule
-    if (rule->is_exception) {
-        exception_rules_.push_back(std::move(rule));
-    } else if (!rule->domain.empty()) {
-        std::string domain = rule->domain;
-        // Lowercase
-        std::transform(domain.begin(), domain.end(), domain.begin(), ::tolower);
-        domain_rules_[domain].push_back(std::move(rule));
-    } else {
-        generic_rules_.push_back(std::move(rule));
-    }
+    // A rule with neither a host nor a pattern matches every URL in existence.
+    // That is never what a list author meant — and an exception shaped like
+    // that whitelists the entire web.
+    if (rule->domain.empty() && rule->pattern.empty()) return;
+
+    total_rules_++;
+    const FilterRule* ptr = rule.get();
+    storage_.push_back(std::move(rule));
+    IndexRule(ptr, ptr->is_exception ? exception_ : block_);
 }
 
-void FilterRuleSet::ParseOptions(const std::string& options, FilterRule& rule) {
+bool FilterRuleSet::ParseOptions(const std::string& options, FilterRule& rule,
+                                 bool& document_exception) {
+    uint32_t positive = 0;
+    uint32_t negative = 0;
+
     size_t start = 0;
-    while (start < options.size()) {
-        auto comma = options.find(',', start);
-        std::string opt;
-        if (comma != std::string::npos) {
-            opt = options.substr(start, comma - start);
-            start = comma + 1;
-        } else {
-            opt = options.substr(start);
-            start = options.size();
+    while (start <= options.size()) {
+        const auto comma = options.find(',', start);
+        std::string opt = (comma == std::string::npos) ? options.substr(start)
+                                                       : options.substr(start, comma - start);
+        start = (comma == std::string::npos) ? options.size() + 1 : comma + 1;
+        if (opt.empty()) continue;
+
+        if (opt.rfind("domain=", 0) == 0) {
+            const std::string value = opt.substr(7);
+            size_t p = 0;
+            while (p < value.size()) {
+                const auto bar = value.find('|', p);
+                std::string d = (bar == std::string::npos) ? value.substr(p)
+                                                           : value.substr(p, bar - p);
+                p = (bar == std::string::npos) ? value.size() : bar + 1;
+                if (d.empty()) continue;
+                if (d[0] == '~') rule.exclude_domains.push_back(ToLower(d.substr(1)));
+                else rule.include_domains.push_back(ToLower(d));
+            }
+            continue;
+        }
+
+        bool negated = false;
+        if (opt[0] == '~') {
+            negated = true;
+            opt.erase(0, 1);
         }
 
         if (opt == "third-party") {
-            rule.third_party = true;
-        } else if (opt == "~third-party") {
-            rule.first_party_only = true;
-        } else if (opt == "script") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_SCRIPT;
-        } else if (opt == "image") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_IMAGE;
-        } else if (opt == "stylesheet") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_STYLESHEET;
-        } else if (opt == "xmlhttprequest") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_XHR;
-        } else if (opt == "subdocument") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_SUBDOCUMENT;
-        } else if (opt == "media") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_MEDIA;
-        } else if (opt == "font") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_FONT;
-        } else if (opt == "websocket") {
-            rule.has_resource_types = true;
-            rule.resource_types = ZRT_WEBSOCKET;
+            if (negated) rule.first_party_only = true;
+            else rule.third_party = true;
+            continue;
         }
-        // Ignore unknown options
+
+        uint32_t type = 0;
+        if (opt == "script") type = ZRT_SCRIPT;
+        else if (opt == "image") type = ZRT_IMAGE;
+        else if (opt == "stylesheet" || opt == "css") type = ZRT_STYLESHEET;
+        else if (opt == "xmlhttprequest" || opt == "xhr") type = ZRT_XHR;
+        else if (opt == "subdocument" || opt == "frame") type = ZRT_SUBDOCUMENT;
+        else if (opt == "media") type = ZRT_MEDIA;
+        else if (opt == "font") type = ZRT_FONT;
+        else if (opt == "websocket") type = ZRT_WEBSOCKET;
+        else if (opt == "other" || opt == "ping" || opt == "beacon" ||
+                 opt == "object" || opt == "object-subrequest") type = ZRT_OTHER;
+        if (type) {
+            if (negated) negative |= type;
+            else positive |= type;
+            continue;
+        }
+
+        if (opt == "all") continue;         // every type, which is the default
+        if (opt == "match-case") continue;  // we compare lowercased throughout
+        if (opt == "important") continue;   // rule priority is not modelled
+
+        if (rule.is_exception && opt == "document") {
+            document_exception = true;
+            continue;
+        }
+
+        // csp=, redirect=, removeparam=, rewrite=, popup, generichide,
+        // elemhide, denyallow, header=, ... — applying these as plain network
+        // rules would block far more than the author asked for.
+        return false;
     }
+
+    if (positive) {
+        rule.resource_types = positive;
+        rule.has_resource_types = true;
+    } else if (negative) {
+        rule.resource_types = ZRT_ALL & ~negative;
+        rule.has_resource_types = true;
+    }
+    return true;
 }
 
-bool FilterRuleSet::ShouldBlock(const std::string& url, const std::string& page_domain,
-                                 uint32_t resource_type) const {
-    // Check exception rules first
-    for (const auto& rule : exception_rules_) {
-        if (rule->has_resource_types && !(rule->resource_types & resource_type))
-            continue;
-        if (!rule->domain.empty() && !MatchDomain(ExtractDomain(url), rule->domain))
-            continue;
-        if (MatchPattern(url, rule->pattern))
-            return false;  // Whitelisted
+void FilterRuleSet::IndexRule(const FilterRule* rule, Index& index) {
+    if (!rule->domain.empty()) {
+        index.by_domain[rule->domain].push_back(rule);
+        return;
+    }
+    std::string token = PickIndexToken(rule->pattern, rule->anchor_start, rule->anchor_end);
+    if (token.empty()) index.untokenized.push_back(rule);
+    else index.by_token[std::move(token)].push_back(rule);
+}
+
+namespace {
+
+bool RuleMatches(const FilterRule& rule, std::string_view url, std::string_view host,
+                 std::string_view page_domain, uint32_t resource_type, size_t start) {
+    if (rule.has_resource_types && !(rule.resource_types & resource_type)) return false;
+
+    if (rule.third_party || rule.first_party_only) {
+        const bool third = IsThirdParty(host, page_domain);
+        if (rule.third_party && !third) return false;
+        if (rule.first_party_only && third) return false;
     }
 
-    // Check domain-anchored rules
-    std::string url_domain = ExtractDomain(url);
-    std::string lower_domain = url_domain;
-    std::transform(lower_domain.begin(), lower_domain.end(), lower_domain.begin(), ::tolower);
+    if (!rule.include_domains.empty()) {
+        bool included = false;
+        for (const auto& d : rule.include_domains) {
+            if (HostMatches(page_domain, d)) {
+                included = true;
+                break;
+            }
+        }
+        if (!included) return false;
+    }
+    for (const auto& d : rule.exclude_domains) {
+        if (HostMatches(page_domain, d)) return false;
+    }
 
-    // Try matching against the domain and its parent domains
-    std::string check_domain = lower_domain;
-    while (!check_domain.empty()) {
-        auto it = domain_rules_.find(check_domain);
-        if (it != domain_rules_.end()) {
-            for (const auto& rule : it->second) {
-                if (rule->has_resource_types && !(rule->resource_types & resource_type))
-                    continue;
-                if (rule->third_party && !IsThirdParty(url, page_domain))
-                    continue;
-                if (rule->first_party_only && IsThirdParty(url, page_domain))
-                    continue;
-                // Domain already matched by map key, check pattern part
-                if (rule->pattern.empty() || MatchPattern(url, rule->pattern))
+    return MatchPattern(url, rule, start);
+}
+
+}  // namespace
+
+bool FilterRuleSet::MatchesIndex(const Index& index, const MatchContext& ctx) const {
+    // Host-anchored rules for the host itself and each parent domain.
+    std::string_view d = ctx.host;
+    while (!d.empty()) {
+        const auto it = index.by_domain.find(d);
+        if (it != index.by_domain.end()) {
+            for (const FilterRule* rule : it->second) {
+                if (RuleMatches(*rule, ctx.url, ctx.host, ctx.page_domain,
+                                ctx.resource_type, ctx.host_end))
                     return true;
             }
         }
-
-        // Try parent domain
-        auto dot = check_domain.find('.');
-        if (dot == std::string::npos) break;
-        check_domain = check_domain.substr(dot + 1);
+        const auto dot = d.find('.');
+        if (dot == std::string_view::npos) break;
+        d = d.substr(dot + 1);
     }
 
-    // Check generic rules
-    for (const auto& rule : generic_rules_) {
-        if (rule->has_resource_types && !(rule->resource_types & resource_type))
-            continue;
-        if (rule->third_party && !IsThirdParty(url, page_domain))
-            continue;
-        if (rule->first_party_only && IsThirdParty(url, page_domain))
-            continue;
-        if (MatchPattern(url, rule->pattern))
+    // Generic rules, reached only through the tokens the URL actually contains.
+    if (!index.by_token.empty()) {
+        std::vector<std::string_view> tokens;
+        tokens.reserve(24);
+        CollectTokens(ctx.url, tokens);
+        for (std::string_view token : tokens) {
+            const auto it = index.by_token.find(token);
+            if (it == index.by_token.end()) continue;
+            for (const FilterRule* rule : it->second) {
+                if (RuleMatches(*rule, ctx.url, ctx.host, ctx.page_domain,
+                                ctx.resource_type, 0))
+                    return true;
+            }
+        }
+    }
+
+    for (const FilterRule* rule : index.untokenized) {
+        if (RuleMatches(*rule, ctx.url, ctx.host, ctx.page_domain, ctx.resource_type, 0))
             return true;
     }
-
     return false;
 }
 
-std::string FilterRuleSet::ExtractDomain(const std::string& url) {
-    auto scheme_end = url.find("://");
-    if (scheme_end == std::string::npos) return url;
+bool FilterRuleSet::ShouldBlock(const std::string& url, const std::string& page_domain,
+                                uint32_t resource_type) const {
+    if (url.empty()) return false;
 
-    auto domain_start = scheme_end + 3;
-    auto domain_end = url.find_first_of(":/", domain_start);
-    if (domain_end == std::string::npos) domain_end = url.size();
+    const std::string lower_url = ToLower(url);
+    const std::string lower_page = ToLower(page_domain);
 
-    return url.substr(domain_start, domain_end - domain_start);
-}
+    MatchContext ctx;
+    ctx.url = lower_url;
+    ctx.host = HostOf(lower_url, &ctx.host_end);
+    ctx.page_domain = lower_page;
+    ctx.resource_type = resource_type;
 
-bool FilterRuleSet::MatchPattern(const std::string& url, const std::string& pattern) {
-    if (pattern.empty()) return true;
-
-    // Handle wildcard patterns
-    if (pattern.find('*') != std::string::npos) {
-        // Split by * and match each part sequentially
-        size_t url_pos = 0;
-        size_t pat_start = 0;
-        while (pat_start < pattern.size()) {
-            auto star = pattern.find('*', pat_start);
-            std::string part;
-            if (star != std::string::npos) {
-                part = pattern.substr(pat_start, star - pat_start);
-                pat_start = star + 1;
-            } else {
-                part = pattern.substr(pat_start);
-                pat_start = pattern.size();
-            }
-
-            if (part.empty()) continue;
-
-            // Replace ^ with separator matching
-            std::string search_part;
-            for (char c : part) {
-                if (c == '^') continue;  // simplified: skip separator chars
-                search_part += c;
-            }
-
-            if (search_part.empty()) continue;
-
-            auto found = url.find(search_part, url_pos);
-            if (found == std::string::npos) return false;
-            url_pos = found + search_part.length();
+    // Site-wide allowlist first: @@||host^$document disables blocking here.
+    if (!document_allowlist_.empty()) {
+        std::string_view d = ctx.page_domain;
+        while (!d.empty()) {
+            if (document_allowlist_.find(d) != document_allowlist_.end())
+                return false;
+            const auto dot = d.find('.');
+            if (dot == std::string_view::npos) break;
+            d = d.substr(dot + 1);
         }
-        return true;
     }
 
-    // Handle ^ separator char — replace with simple substring match
-    std::string clean_pattern;
-    for (char c : pattern) {
-        if (c == '^') continue;
-        clean_pattern += c;
-    }
-
-    if (clean_pattern.empty()) return true;
-    return url.find(clean_pattern) != std::string::npos;
-}
-
-bool FilterRuleSet::IsSeparatorChar(char c) {
-    if (c >= 'a' && c <= 'z') return false;
-    if (c >= 'A' && c <= 'Z') return false;
-    if (c >= '0' && c <= '9') return false;
-    if (c == '-' || c == '.' || c == '%') return false;
-    return true;
-}
-
-bool FilterRuleSet::MatchDomain(const std::string& url_domain, const std::string& rule_domain) {
-    if (url_domain == rule_domain) return true;
-    // Check if url_domain ends with .rule_domain
-    if (url_domain.length() > rule_domain.length()) {
-        auto pos = url_domain.length() - rule_domain.length();
-        return url_domain[pos - 1] == '.' && url_domain.substr(pos) == rule_domain;
-    }
-    return false;
-}
-
-bool FilterRuleSet::IsThirdParty(const std::string& url, const std::string& page_domain) {
-    std::string url_domain = ExtractDomain(url);
-    // Simple: different domains = third party
-    if (url_domain == page_domain) return false;
-    // Check if one is subdomain of the other
-    if (url_domain.length() > page_domain.length()) {
-        auto pos = url_domain.length() - page_domain.length();
-        if (url_domain[pos - 1] == '.' && url_domain.substr(pos) == page_domain) return false;
-    }
-    if (page_domain.length() > url_domain.length()) {
-        auto pos = page_domain.length() - url_domain.length();
-        if (page_domain[pos - 1] == '.' && page_domain.substr(pos) == url_domain) return false;
-    }
-    return true;
+    if (MatchesIndex(exception_, ctx)) return false;
+    return MatchesIndex(block_, ctx);
 }

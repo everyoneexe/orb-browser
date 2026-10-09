@@ -53,16 +53,20 @@ cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# Copy Widevine DRM if available on system
-if [ ! -d "WidevineCdm" ]; then
-    for wv_path in /usr/lib/chromium/WidevineCdm /usr/lib64/chromium/WidevineCdm /opt/google/chrome/WidevineCdm; do
-        if [ -d "$wv_path" ]; then
-            cp -r "$wv_path" WidevineCdm
-            echo "Widevine CDM copied from $wv_path"
-            break
+# Install Widevine DRM into user cache (CEF expects versioned path)
+CACHE_DIR="$HOME/.cache/orb-browser/WidevineCdm"
+for wv_path in /usr/lib/chromium/WidevineCdm /usr/lib64/chromium/WidevineCdm /opt/google/chrome/WidevineCdm; do
+    if [ -d "$wv_path" ] && [ -f "$wv_path/manifest.json" ]; then
+        WV_VER=$(python3 -c "import json; print(json.load(open('$wv_path/manifest.json'))['version'])" 2>/dev/null)
+        if [ -n "$WV_VER" ] && [ ! -d "$CACHE_DIR/$WV_VER" ]; then
+            mkdir -p "$CACHE_DIR/$WV_VER"
+            cp -r "$wv_path"/* "$CACHE_DIR/$WV_VER/"
+            echo "{\"Path\":\"$CACHE_DIR/$WV_VER\"}" > "$CACHE_DIR/latest-component-updated-widevine-cdm"
+            echo "Widevine CDM $WV_VER installed to cache"
         fi
-    done
-fi
+        break
+    fi
+done
 
 echo ""
 echo "Build complete! Run with: cd build && ./orb-browser"

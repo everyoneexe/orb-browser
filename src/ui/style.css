@@ -269,7 +269,7 @@ body {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 8px;
-    animation: tab-slide-in 0.2s ease-out both;
+    animation: orb-tab-open 0.2s ease-out both;
 }
 
 #find-input {
@@ -384,21 +384,30 @@ body {
     justify-content: center;
     height: 42px;
     background: var(--bg-tertiary);
-    border-radius: 8px;
+    border-radius: 10px;
     cursor: pointer;
     border: 2px solid transparent;
-    transition: background 0.15s, border-color 0.15s;
+    transition: background 0.15s ease, border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
     position: relative;
     min-width: 0;
     width: 100%;
+    transform-origin: center center;
 }
 
 .pinned-tab:hover {
     background: var(--bg-hover);
+    transform: scale(1.04);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.pinned-tab:active {
+    transform: scale(0.96);
+    transition-duration: 0.08s;
 }
 
 .pinned-tab.active {
     border-color: var(--accent);
+    box-shadow: 0 0 8px rgba(122, 162, 247, 0.2);
 }
 
 .pinned-tab img {
@@ -494,35 +503,52 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 4px 8px;
-    border-radius: 8px;
+    padding: 6px 8px;
+    border-radius: 10px;
     cursor: pointer;
-    min-height: 28px;
-    transition: background 0.15s, opacity 0.2s, transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-    animation: tab-slide-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
+    min-height: 32px;
+    position: relative;
+    transition: background 0.15s ease, transform 0.2s ease, opacity 0.2s ease, max-height 0.2s ease;
+    animation: orb-tab-open 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
     will-change: transform, opacity;
+    transform-origin: center center;
 }
 
 .tab-item:hover {
     background: var(--bg-hover);
+    transform: scale(1.01);
+}
+
+.tab-item:active:not(.dragging) {
+    transform: scale(0.98);
+    transition-duration: 0.08s;
 }
 
 .tab-item.active {
     background: rgba(255, 255, 255, 0.08);
-    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.05);
+    border-left: 3px solid var(--accent);
+    padding-left: 5px;
+}
+
+.tab-item.split {
+    border-right: 3px solid #73daca;
+    padding-right: 5px;
 }
 
 .tab-item.closing {
-    animation: tab-slide-out 0.2s ease-in forwards;
+    animation: orb-tab-close 0.2s ease-in forwards;
+    pointer-events: none;
 }
 
 .tab-item.switching-in {
-    animation: tab-fade-in 0.15s ease-out both;
+    animation: orb-tab-switch 0.2s ease-out both;
 }
 
 .tab-item.dragging {
-    opacity: 0.4;
+    opacity: 0.5;
+    transform: scale(1.02);
     background: var(--bg-active);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
     z-index: 10;
 }
 
@@ -534,35 +560,59 @@ body {
     cursor: grabbing;
 }
 
-@keyframes tab-slide-in {
+@keyframes orb-tab-open {
     from {
         opacity: 0;
-        transform: translateX(-12px);
+        transform: scale(0.96);
+        max-height: 0;
     }
     to {
         opacity: 1;
-        transform: translateX(0);
+        transform: scale(1);
+        max-height: 44px;
     }
 }
 
-@keyframes tab-slide-out {
-    from {
+@keyframes orb-tab-close {
+    0% {
         opacity: 1;
-        transform: translateX(0);
-        max-height: 36px;
+        transform: scale(1);
+        max-height: 44px;
     }
-    to {
+    60% {
         opacity: 0;
-        transform: translateX(-20px);
+        transform: scale(0.94);
+    }
+    100% {
+        opacity: 0;
+        transform: scale(0.94);
         max-height: 0;
         padding: 0 8px;
         margin: 0;
     }
 }
 
-@keyframes tab-fade-in {
-    from { opacity: 0.5; }
-    to   { opacity: 1; }
+@keyframes orb-tab-switch {
+    from {
+        opacity: 0.6;
+        transform: scale(0.98);
+    }
+    to {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+    .tab-item {
+        animation: none !important;
+        transition: background 0.15s ease !important;
+    }
+    .tab-item:hover,
+    .tab-item:active {
+        transform: none !important;
+    }
 }
 
 .tab-favicon {
@@ -606,8 +656,8 @@ body {
     display: none;
     align-items: center;
     justify-content: center;
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
     border: none;
     background: transparent;
     color: var(--text-muted);
@@ -615,7 +665,7 @@ body {
     cursor: pointer;
     flex-shrink: 0;
     line-height: 1;
-    transition: all 0.15s ease;
+    transition: all 0.15s ease, transform 0.1s ease;
     padding: 0;
 }
 
@@ -629,26 +679,53 @@ body {
 }
 
 .tab-close:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: var(--text-primary);
+    background: rgba(247, 118, 142, 0.15);
+    color: var(--close-hover);
 }
 
 .tab-close:active {
-    transform: scale(0.9);
+    transform: scale(0.85);
 }
 
 /* Footer */
 #sidebar-footer {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     padding: 6px 0;
     border-top: 1px solid var(--border-color);
     margin-top: 4px;
+}
+
+#compact-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    border-radius: 6px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.15s ease;
+}
+
+#compact-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}
+
+#compact-btn:active {
+    transform: scale(0.9);
 }
 
 #new-tab-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 100%;
+    flex: 1;
     height: 30px;
     border: none;
     background: transparent;
@@ -942,4 +1019,150 @@ button:focus-visible {
     height: 1px;
     background: var(--border-color);
     margin: 3px 8px;
+}
+
+/* ─── Compact mode ─────────────────────────────────── */
+
+body.compact #sidebar {
+    padding: 6px 4px;
+    align-items: center;
+}
+
+body.compact #sidebar-header {
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+
+body.compact #nav-buttons {
+    display: none;
+}
+
+body.compact #url-bar-container {
+    display: none;
+}
+
+body.compact #find-bar {
+    display: none !important;
+}
+
+body.compact #menu-btn,
+body.compact #nav-buttons button {
+    width: 32px;
+    height: 32px;
+}
+
+body.compact #logo {
+    width: 32px;
+    height: 32px;
+    font-size: 15px;
+    border-radius: 8px;
+}
+
+body.compact #pinned-tabs {
+    grid-template-columns: 1fr !important;
+    padding: 4px;
+    gap: 3px;
+}
+
+body.compact .pinned-tab {
+    height: 36px;
+    border-radius: 8px;
+}
+
+body.compact .pinned-tab img {
+    width: 18px;
+    height: 18px;
+}
+
+body.compact #tabs-label,
+body.compact #bookmarks-section,
+body.compact #history-panel,
+body.compact #downloads-section {
+    display: none !important;
+}
+
+body.compact #tab-list {
+    gap: 3px;
+    padding: 0;
+}
+
+body.compact .tab-item {
+    justify-content: center;
+    padding: 6px;
+    min-height: 36px;
+    border-radius: 8px;
+}
+
+body.compact .tab-title {
+    display: none;
+}
+
+body.compact .tab-close {
+    display: none !important;
+}
+
+body.compact .tab-item.active {
+    border-left: none;
+    padding-left: 6px;
+    border-bottom: 3px solid var(--accent);
+    padding-bottom: 3px;
+}
+
+body.compact .tab-fav-container {
+    width: 20px;
+    height: 20px;
+}
+
+body.compact .tab-favicon {
+    width: 20px;
+    height: 20px;
+}
+
+body.compact .tab-favicon-placeholder {
+    width: 20px;
+    height: 20px;
+}
+
+body.compact #sidebar-footer {
+    flex-direction: column;
+    gap: 3px;
+    border-top: none;
+}
+
+body.compact #compact-btn,
+body.compact #new-tab-btn {
+    width: 32px;
+    height: 32px;
+    flex: none;
+}
+
+body.compact #menu-popup {
+    left: 48px;
+    top: 8px;
+}
+
+/* Compact tab tooltip */
+body.compact .tab-item {
+    position: relative;
+}
+
+body.compact .tab-item[data-tooltip]:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: calc(100% + 8px);
+    top: 50%;
+    transform: translateY(-50%);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    white-space: nowrap;
+    z-index: 300;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    pointer-events: none;
+    animation: menu-fade-in 0.1s ease-out;
 }

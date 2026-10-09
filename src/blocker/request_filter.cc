@@ -35,9 +35,13 @@ CefResourceRequestHandler::ReturnValue RequestFilter::OnBeforeResourceLoad(
         }
     }
 
-    uint32_t rt = MapResourceType(request->GetResourceType());
+    const cef_resource_type_t cef_type = request->GetResourceType();
 
-    if (rules_ && rules_->ShouldBlock(url, page_domain, rt)) {
+    // The top-level document is navigation, not a subresource: cancelling it
+    // leaves a blank tab with no explanation.
+    if (cef_type == RT_MAIN_FRAME) return RV_CONTINUE;
+
+    if (rules_ && rules_->ShouldBlock(url, page_domain, MapResourceType(cef_type))) {
         return RV_CANCEL;
     }
 

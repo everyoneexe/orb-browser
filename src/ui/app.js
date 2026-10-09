@@ -2,6 +2,8 @@
 
 let activeTabId = -1;
 let isCurrentTabLoading = false;
+let splitViewActive = false;
+let splitViewSecondTabId = -1;
 const tabs = new Map();
 const knownTabIds = new Set();
 const pinnedTabIds = new Set();  // track which tab IDs are pinned
@@ -145,6 +147,16 @@ function updateTabElement(id, info, el) {
     const titleEl = el.querySelector('.tab-title');
     const newTitle = (info._incognito ? '\u{1F576} ' : '') + (info.title || info.url || 'New Tab');
     if (titleEl.textContent !== newTitle) titleEl.textContent = newTitle;
+
+    // Compact mode tooltip
+    if (compactMode) {
+        el.setAttribute('data-tooltip', info.title || info.url || 'New Tab');
+    } else {
+        el.removeAttribute('data-tooltip');
+    }
+
+    // Split view indicator
+    el.classList.toggle('split', splitViewActive && id === splitViewSecondTabId);
 
     // Favicon — only update if URL origin changed
     const favContainer = el.querySelector('.tab-fav-container');
@@ -393,6 +405,21 @@ function showTabContextMenu(tabId, x, y) {
     addCtxItem(menu, 'Duplicate Tab', () => {
         sendCommand({ cmd: 'newTab', url: info.url });
     });
+    addCtxSeparator(menu);
+
+    // Split view options
+    if (splitViewActive && splitViewSecondTabId === tabId) {
+        addCtxItem(menu, 'Close Split View', () => {
+            sendCommand({ cmd: 'splitViewClose' });
+        });
+    } else if (tabId !== activeTabId) {
+        addCtxItem(menu, 'Split Side by Side', () => {
+            sendCommand({ cmd: 'splitView', tabId });
+        });
+        addCtxItem(menu, 'Split Top/Bottom', () => {
+            sendCommand({ cmd: 'splitView', tabId, vertical: true });
+        });
+    }
     addCtxSeparator(menu);
 
     if (!isEssential) {
@@ -733,10 +760,21 @@ document.getElementById('history-clear').onclick = () => {
 // ─── Menu popup ────────────────────────────────────────
 
 let menuVisible = false;
+let compactBeforeMenu = false;
 
 function toggleMenu() {
     menuVisible = !menuVisible;
+    if (menuVisible && compactMode) {
+        compactBeforeMenu = true;
+        document.body.classList.remove('compact');
+        sendCommand({ cmd: 'sidebarWidth', width: 280 });
+    }
     document.getElementById('menu-popup').style.display = menuVisible ? 'block' : 'none';
+    if (!menuVisible && compactBeforeMenu) {
+        compactBeforeMenu = false;
+        document.body.classList.add('compact');
+        sendCommand({ cmd: 'sidebarWidth', width: 48 });
+    }
 }
 
 document.getElementById('menu-btn').onclick = () => toggleMenu();
@@ -746,6 +784,11 @@ document.addEventListener('click', (e) => {
     if (menuVisible && !document.getElementById('menu-popup').contains(e.target) && e.target.id !== 'menu-btn' && !e.target.closest('#menu-btn')) {
         menuVisible = false;
         document.getElementById('menu-popup').style.display = 'none';
+        if (compactBeforeMenu) {
+            compactBeforeMenu = false;
+            document.body.classList.add('compact');
+            sendCommand({ cmd: 'sidebarWidth', width: 48 });
+        }
     }
 });
 
@@ -801,6 +844,9 @@ const orb = {
             renderPinnedTab(id, url);
         }
         scheduleRender();
+        if (url && url.startsWith('orb://newtab')) {
+            setTimeout(() => orb.focusAddressBar(), 100);
+        }
     },
     onTabClosed(id) {
         tabs.delete(id); knownTabIds.delete(id);
@@ -938,6 +984,12 @@ const orb = {
             logo.style.outline = '2px dashed var(--accent)';
             logo.style.outlineOffset = '2px';
         }
+    },
+    onSplitViewChanged(active, secondTabId) {
+        splitViewActive = active;
+        splitViewSecondTabId = secondTabId;
+        // Update tab list to show split indicator
+        scheduleRender();
     }
 };
 window.orb = orb;
@@ -1044,10 +1096,41 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && menuVisible) { menuVisible = false; document.getElementById('menu-popup').style.display = 'none'; }
 });
 
+// ─── Compact mode ────────────────────────────────────
+
+let compactMode = localStorage.getItem('orb-compact') === 'true';
+
+function toggleCompactMode() {
+    compactMode = !compactMode;
+    applyCompactMode();
+    localStorage.setItem('orb-compact', compactMode);
+    sendCommand({ cmd: 'sidebarWidth', width: compactMode ? 48 : 280 });
+}
+
+function applyCompactMode() {
+    document.body.classList.toggle('compact', compactMode);
+    // Update tooltips on tabs
+    for (const [id, el] of tabElements) {
+        const info = tabs.get(id);
+        if (compactMode && info) {
+            el.setAttribute('data-tooltip', info.title || info.url || 'New Tab');
+        } else {
+            el.removeAttribute('data-tooltip');
+        }
+    }
+}
+
+document.getElementById('compact-btn').addEventListener('click', toggleCompactMode);
+
 // ─── Init ──────────────────────────────────────────────
 
 loadBookmarks();
 loadPinnedTabs();
+if (compactMode) {
+    applyCompactMode();
+    // Notify C++ of compact width on startup
+    setTimeout(() => sendCommand({ cmd: 'sidebarWidth', width: 48 }), 100);
+}
 
 // Load saved settings
 sendCommand({ cmd: 'settingsGet' }).then(data => {
